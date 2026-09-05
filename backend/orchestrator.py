@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import operator
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -95,91 +97,196 @@ def _load_tool_code(name: str) -> str | None:
     return path.read_text(encoding="utf-8")
 
 
+# Canonical tool names for clear computational requests (not free-form NLP).
+_KNOWN_QUANTITIES = {
+    "speed": "speed",
+    "velocity": "speed",
+    "distance": "distance",
+    "time": "time",
+    "average": "average",
+    "probability": "probability",
+    "prob": "probability",
+}
+
+_DEFAULT_ARGS = {
+    "speed": [120.0, 2.0],
+    "distance": [60.0, 2.0],
+    "time": [120.0, 60.0],
+    "probability": [13.0, 52.0],
+}
+
+
+def _intended_tool_name(task: str) -> str | None:
+    """
+    What tool purpose does this clear request ask for?
+    Prefer the quantity being computed, not every keyword in the sentence.
+    Returns None when there is no confident mapping → do not reuse.
+    """
+    lower = task.lower().strip()
+
+    # "compute/calculate/find the <quantity>"
+    m = re.search(
+        r"\b(?:compute|calculate|find|determine|get)\s+(?:the\s+)?(\w+)",
+        lower,
+    )
+    if m and m.group(1) in _KNOWN_QUANTITIES:
+        return _KNOWN_QUANTITIES[m.group(1)]
+
+    # "<quantity> from ..." — left-hand quantity is what we build
+    m = re.search(
+        r"\b(speed|velocity|distance|time|average|probability)\b"
+        r"(?:\s+\w+){0,3}\s+from\b",
+        lower,
+    )
+    if m:
+        return _KNOWN_QUANTITIES[m.group(1)]
+
+    # "train speed ...", or a leading known quantity as the subject
+    m = re.search(
+        r"\b(?:train\s+)?(speed|velocity|distance|time|average|probability)\b",
+        lower,
+    )
+    if m:
+        return _KNOWN_QUANTITIES[m.group(1)]
+
+    if re.search(r"\bprobability\b", lower):
+        return "probability"
+
+    return None
+
+
 def _find_matching_tool(task: str, manifest: list[dict]) -> dict | None:
-    """Simple match: tool name or description keywords appear in the task."""
-    lower = task.lower()
+    """
+    Reuse only on a confident purpose match (intended name == tool name).
+    Loose keyword overlap is NOT enough — e.g. a distance request must not
+    reuse a speed tool just because the word 'speed' appears in the text.
+    """
+    intended = _intended_tool_name(task)
+    if not intended:
+        return None
+
     for entry in manifest:
         name = (entry.get("name") or "").lower()
-        if name and name in lower:
-            return entry
-        desc = (entry.get("description") or "").lower()
-        desc_words = {w for w in re.findall(r"[a-z]+", desc) if len(w) > 3}
-        task_words = {w for w in re.findall(r"[a-z]+", lower) if len(w) > 3}
-        if desc_words and len(desc_words & task_words) >= 2:
+        if name == intended:
             return entry
     return None
 
 
 # ---------------------------------------------------------------------------
-# Trivial vs needs-a-tool heuristic
+# Trivial path — ONLY clean arithmetic (safe eval, no bare eval)
 # ---------------------------------------------------------------------------
-_ARITH_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([+\-*/])\s*(\d+(?:\.\d+)?)")
+_ARITH_CHARS_RE = re.compile(r"^[\d\.\+\-\*/\(\)\s]+$")
 
-_TOOL_KEYWORDS = (
-    "speed",
-    "distance",
-    "compute",
-    "calculate",
-    "convert",
-    "average",
-    "velocity",
-)
-
-
-def _is_arithmetic(task: str) -> bool:
-    return bool(_ARITH_RE.search(task))
+_BIN_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+}
+_UNARY_OPS = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
 
 
-def _looks_like_tool_task(task: str) -> bool:
-    lower = task.lower()
-    return any(k in lower for k in _TOOL_KEYWORDS)
+def _eval_arith_node(node: ast.AST) -> float:
+    """Evaluate an AST that may contain only numbers and + - * / (unary ±)."""
+    if isinstance(node, ast.Expression):
+        return _eval_arith_node(node.body)
+
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+
+    if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
+        left = _eval_arith_node(node.left)
+        right = _eval_arith_node(node.right)
+        if isinstance(node.op, ast.Div) and right == 0:
+            raise ValueError("division by zero")
+        return _BIN_OPS[type(node.op)](left, right)
+
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
+        return _UNARY_OPS[type(node.op)](_eval_arith_node(node.operand))
+
+    raise ValueError("unsupported expression")
+
+
+def _try_eval_arithmetic(task: str) -> str | None:
+    """
+    If `task` is a clean arithmetic expression, return its result as a string.
+    Otherwise return None (not trivial — route to tool path).
+    """
+    expr = task.strip()
+    if not expr or not _ARITH_CHARS_RE.fullmatch(expr):
+        return None
+
+    try:
+        tree = ast.parse(expr, mode="eval")
+        value = _eval_arith_node(tree)
+    except (SyntaxError, ValueError, TypeError, OverflowError):
+        return None
+
+    if value == int(value):
+        return str(int(value))
+    return str(value)
 
 
 def _is_trivial(task: str) -> bool:
-    if _is_arithmetic(task):
-        return True
-    return not _looks_like_tool_task(task)
-
-
-def _eval_arithmetic(task: str) -> str:
-    match = _ARITH_RE.search(task)
-    if not match:
-        return "0"
-    a, op, b = float(match.group(1)), match.group(2), float(match.group(3))
-    ops = {
-        "+": a + b,
-        "-": a - b,
-        "*": a * b,
-        "/": (a / b) if b != 0 else float("nan"),
-    }
-    result = ops[op]
-    if result == int(result):
-        return str(int(result))
-    return str(result)
+    """True only when the whole task is a safely evaluable arithmetic expression."""
+    return _try_eval_arithmetic(task) is not None
 
 
 def _answer_trivial(task: str) -> str:
-    if _is_arithmetic(task):
-        return _eval_arithmetic(task)
-    return f"Answered directly (no tool needed): {task.strip()}"
+    result = _try_eval_arithmetic(task)
+    if result is None:
+        raise ValueError("not a clean arithmetic expression")
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Task -> factory spec / run args
 # ---------------------------------------------------------------------------
+def _slug_tool_name(task: str) -> str:
+    words = re.findall(r"[a-z0-9]+", task.lower())[:4]
+    return "_".join(words)[:32] or "custom_tool"
+
+
 def _build_task_spec(task: str) -> dict:
-    lower = task.lower()
-    if any(k in lower for k in ("speed", "distance", "velocity", "time")):
+    """Build create_tool contract from a clear computational request."""
+    name = _intended_tool_name(task) or _slug_tool_name(task)
+    description = task.strip()
+
+    if name == "speed":
         return {
             "name": "speed",
-            "description": task.strip(),
+            "description": description,
             "inputs": ["distance_km", "time_hr"],
             "tests": [{"args": [120, 2], "expected": 60}],
         }
-    slug = re.sub(r"[^a-z0-9]+", "_", lower).strip("_")[:32] or "custom_tool"
+    if name == "distance":
+        return {
+            "name": "distance",
+            "description": description,
+            "inputs": ["speed_kmh", "time_hr"],
+            "tests": [{"args": [60, 2], "expected": 120}],
+        }
+    if name == "time":
+        return {
+            "name": "time",
+            "description": description,
+            "inputs": ["distance_km", "speed_kmh"],
+            "tests": [{"args": [120, 60], "expected": 2}],
+        }
+    if name == "probability":
+        return {
+            "name": "probability",
+            "description": description,
+            "inputs": ["favorable", "total"],
+            "tests": [{"args": [13, 52], "expected": 0.25}],
+        }
+
     return {
-        "name": slug,
-        "description": task.strip(),
+        "name": name,
+        "description": description,
         "inputs": ["x"],
         "tests": [{"args": [1], "expected": 1}],
     }
@@ -199,10 +306,26 @@ def _extract_numbers(task: str) -> list[float]:
     return [float(n) for n in re.findall(r"\d+(?:\.\d+)?", task)]
 
 
-def _args_for_tool(task: str, signature: str) -> list[float]:
+def _args_for_tool(
+    task: str,
+    signature: str,
+    tool_name: str = "",
+    fallback_args: list[float] | None = None,
+) -> list[float]:
+    """
+    Use numbers from the task when present; otherwise tool-specific demo
+    defaults (or factory test args). Do not invent args from word problems.
+    """
     n = _param_count(signature)
     nums = _extract_numbers(task)
-    defaults = [120.0, 2.0, 1.0, 1.0]
+    if len(nums) >= n and n > 0:
+        return nums[:n]
+
+    defaults = (
+        list(fallback_args)
+        if fallback_args is not None
+        else list(_DEFAULT_ARGS.get(tool_name, [120.0, 2.0, 1.0, 1.0]))
+    )
     while len(nums) < n:
         nums.append(defaults[len(nums) % len(defaults)])
     return nums[:n] if n else nums
@@ -212,7 +335,11 @@ def _format_arg(value: float) -> str:
     return str(int(value)) if value == int(value) else str(value)
 
 
-def _run_existing_tool(entry: dict, task: str) -> tuple[str | None, dict, str]:
+def _run_existing_tool(
+    entry: dict,
+    task: str,
+    fallback_args: list[float] | None = None,
+) -> tuple[str | None, dict, str]:
     """
     Load toolbox/<name>.py and execute via Sandbox.run_tool.
     Returns (stdout_or_None, sandbox_result, entry_call).
@@ -222,7 +349,12 @@ def _run_existing_tool(entry: dict, task: str) -> tuple[str | None, dict, str]:
     if code is None:
         return None, {"ok": False, "reason": f"missing file {name}.py"}, ""
 
-    args = _args_for_tool(task, entry.get("signature", ""))
+    args = _args_for_tool(
+        task,
+        entry.get("signature", ""),
+        tool_name=name,
+        fallback_args=fallback_args,
+    )
     call = f"print({name}({', '.join(_format_arg(a) for a in args)}))"
     result = run_tool(code, call)
     if result.get("ok"):
@@ -237,7 +369,7 @@ def handle_task(task: str) -> dict[str, Any]:
     """
     Decide:
       1. trivial  -> answer directly
-      2. have tool -> load + sandbox run
+      2. have tool -> load + sandbox run (confident name match only)
       3. need tool -> create_tool (real factory), save, then sandbox-run
 
     Returns { "answer": str, "trace": [ {type, label, detail?} ] }
@@ -254,10 +386,12 @@ def handle_task(task: str) -> dict[str, Any]:
         trace.append(_step("answer", f"Answer: {answer}"))
         return {"answer": answer, "trace": trace}
 
-    # --- Plan for tool-worthy tasks ---
-    trace.append(_step("plan", "Planning: this needs a speed calculation"))
+    intended = _intended_tool_name(task) or "custom"
+    trace.append(
+        _step("plan", f"Planning: this needs a {intended} calculation")
+    )
 
-    # --- Path 2: reuse from toolbox ---
+    # --- Path 2: reuse from toolbox (confident name match only) ---
     trace.append(_step("check", "Checking toolbox for a matching tool"))
     manifest = _load_manifest()
     match = _find_matching_tool(task, manifest)
@@ -265,7 +399,6 @@ def handle_task(task: str) -> dict[str, Any]:
         raw, sandbox_result, call = _run_existing_tool(match, task)
         if raw is not None:
             answer = _format_answer(match["name"], raw)
-            # Reuse: note found tool on the check step; no build steps.
             trace[-1] = _step(
                 "check",
                 f"Found existing tool '{match['name']}' — reusing it",
@@ -274,7 +407,6 @@ def handle_task(task: str) -> dict[str, Any]:
             trace.append(_step("answer", f"Answer: {answer}"))
             return {"answer": answer, "trace": trace}
 
-        # Sandbox failed on existing tool — fall through to factory
         trace.append(
             _step(
                 "fail",
@@ -305,7 +437,13 @@ def handle_task(task: str) -> dict[str, Any]:
     )
     trace.append(_step("testing", "Testing in sandbox against known values"))
 
-    raw, sandbox_result, call = _run_existing_tool(entry, task)
+    test_args = None
+    if task_spec.get("tests"):
+        test_args = [float(a) for a in task_spec["tests"][0]["args"]]
+
+    raw, sandbox_result, call = _run_existing_tool(
+        entry, task, fallback_args=test_args
+    )
     if raw is None:
         reason = sandbox_result.get("reason", "nonzero exit")
         trace.append(_step("fail", f"Test failed: {reason}"))
@@ -313,7 +451,6 @@ def handle_task(task: str) -> dict[str, Any]:
         trace.append(_step("answer", f"Answer: {answer}"))
         return {"answer": answer, "trace": trace}
 
-    # Demo pass label for speed; generic otherwise
     if name == "speed":
         pass_label = "Test passed: speed(120, 2) == 60"
     else:
