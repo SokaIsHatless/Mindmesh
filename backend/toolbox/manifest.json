@@ -2,7 +2,7 @@
   {
     "name": "speed",
     "signature": "speed(distance_km, time_hr)",
-    "description": "compute speed from distance and time",
-    "created_at": "2026-09-05T15:32:21"
+    "description": "train speed from distance and time",
+    "created_at": "2026-09-05T17:02:20.499449+00:00"
   }
 ]
