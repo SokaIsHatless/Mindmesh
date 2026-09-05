@@ -19,7 +19,7 @@ CROSS-PLATFORM: Windows, macOS, and Linux. No WSL needed.
 This is a HACKATHON-GRADE sandbox: reasonable, layered, explainable.
 It is NOT a bulletproof security boundary.
 """
-area = length * breadth
+
 import ast
 import subprocess
 import sys
