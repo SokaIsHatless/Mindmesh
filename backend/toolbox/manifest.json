@@ -1,0 +1,8 @@
+[
+  {
+    "name": "speed",
+    "signature": "speed(distance_km, time_hr)",
+    "description": "train speed from distance and time",
+    "created_at": "2026-09-05T09:50:26.341170+00:00"
+  }
+]
