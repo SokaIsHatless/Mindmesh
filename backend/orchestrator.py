@@ -189,6 +189,9 @@ def _find_matching_tool(task: str, manifest: list[dict]) -> dict | None:
 # ---------------------------------------------------------------------------
 _ARITH_CHARS_RE = re.compile(r"^[\d\.\+\-\*/\(\)\s]+$")
 
+# "3 x 4" / "3x4" / "(2) x 3" — x between numeric operands only, not in words.
+_X_AS_MUL_RE = re.compile(r"(?<=[\d\)])\s*[xX]\s*(?=[\d\(])")
+
 _BIN_OPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -199,6 +202,19 @@ _UNARY_OPS = {
     ast.UAdd: operator.pos,
     ast.USub: operator.neg,
 }
+
+DECLINE_MESSAGE = (
+    "I'm designed for well-defined calculations. Try a clear arithmetic "
+    "expression like '2+5', or a computation like 'train speed from distance "
+    "and time'."
+)
+
+
+def _normalize_multiply(expr: str) -> str:
+    """Turn × and operator-x into * before the restricted arithmetic check."""
+    s = expr.replace("×", "*")
+    s = _X_AS_MUL_RE.sub(" * ", s)
+    return s
 
 
 def _eval_arith_node(node: ast.AST) -> float:
@@ -225,9 +241,9 @@ def _eval_arith_node(node: ast.AST) -> float:
 def _try_eval_arithmetic(task: str) -> str | None:
     """
     If `task` is a clean arithmetic expression, return its result as a string.
-    Otherwise return None (not trivial — route to tool path).
+    Otherwise return None (not trivial — may decline or take tool path).
     """
-    expr = task.strip()
+    expr = _normalize_multiply(task.strip())
     if not expr or not _ARITH_CHARS_RE.fullmatch(expr):
         return None
 
@@ -252,6 +268,33 @@ def _answer_trivial(task: str) -> str:
     if result is None:
         raise ValueError("not a clean arithmetic expression")
     return result
+
+
+def _is_well_defined_request(task: str) -> bool:
+    """
+    True only for clear 'compute <quantity> from <inputs>' style requests.
+    Word problems and chat ("hi", "how far if speed is…") return False → decline.
+    """
+    lower = task.lower().strip()
+
+    # "<quantity> from …" (e.g. train speed from distance and time)
+    if re.search(
+        r"\b(speed|velocity|distance|time|average|probability)\b"
+        r"(?:\s+\w+){0,3}\s+from\b",
+        lower,
+    ):
+        return True
+
+    # "compute/calculate the <quantity> from …"
+    if re.search(
+        r"\b(?:compute|calculate)\s+(?:the\s+)?"
+        r"(speed|velocity|distance|time|average|probability)\b"
+        r".*\bfrom\b",
+        lower,
+    ):
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -380,9 +423,10 @@ def _run_existing_tool(
 def handle_task(task: str) -> dict[str, Any]:
     """
     Decide:
-      1. trivial  -> answer directly
-      2. have tool -> load + sandbox run (confident name match only)
-      3. need tool -> create_tool (real factory), save, then sandbox-run
+      1. trivial   -> evaluate clean arithmetic (incl. x / × as *)
+      2. reuse     -> well-defined request + existing toolbox tool
+      3. factory   -> well-defined request, no tool yet
+      4. decline   -> everything else (chat, word problems, ambiguous)
 
     Returns { "answer": str, "trace": [ {type, label, detail?} ] }
     """
@@ -392,7 +436,7 @@ def handle_task(task: str) -> dict[str, Any]:
     logger.info("=" * 60)
     logger.info("Incoming task: %r", task)
 
-    # --- Path 1: trivial ---
+    # --- Path 1: trivial arithmetic ---
     if _is_trivial(task):
         expr_result = _answer_trivial(task)
         logger.info(
@@ -404,6 +448,22 @@ def handle_task(task: str) -> dict[str, Any]:
         )
         answer = expr_result
         trace.append(_step("answer", f"Answer: {answer}"))
+        return {"answer": answer, "trace": trace}
+
+    # --- Path 4: decline non-computational / ambiguous / word problems ---
+    if not _is_well_defined_request(task):
+        logger.info(
+            "Path chosen: DECLINE — not clean arithmetic and not a "
+            "well-defined computational request"
+        )
+        answer = DECLINE_MESSAGE
+        trace.append(
+            _step(
+                "plan",
+                "This doesn't look like a well-defined calculation",
+            )
+        )
+        trace.append(_step("answer", answer))
         return {"answer": answer, "trace": trace}
 
     intended = _intended_tool_name(task) or "custom"
