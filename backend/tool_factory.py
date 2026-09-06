@@ -8,6 +8,7 @@ Run standalone from backend/:  py tool_factory.py
 
 import datetime
 import json
+import logging
 import sys
 import urllib.error
 import urllib.request
@@ -15,6 +16,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from Sandbox import run_tool
+
+# --- Logging ---
+logger = logging.getLogger("tool_factory")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[tool_factory] %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 # --- Config ---
 MODEL = "phi4-mini"  # may switch to a larger model later; keep as a constant
@@ -120,6 +130,10 @@ def run_tests(code: str, task_spec: dict) -> tuple:
 
         if not result["ok"] or result["reason"] != "ok":
             stderr_snippet = result["stderr"].strip()[-300:]
+            logger.info(
+                "  sandbox test %s -> FAIL | reason=%s | stdout=%r | stderr=%r",
+                entry_call, result["reason"], result.get("stdout", ""), stderr_snippet,
+            )
             failures.append(
                 f"- {name}(*{args!r}) failed to run: {result['reason']} "
                 f"— stderr: {stderr_snippet!r}"
@@ -128,9 +142,18 @@ def run_tests(code: str, task_spec: dict) -> tuple:
 
         actual = result["stdout"].strip()
         if not _values_match(expected, actual):
+            logger.info(
+                "  sandbox test %s -> FAIL | reason=ok | got=%r | expected=%r",
+                entry_call, actual, expected,
+            )
             failures.append(
                 f"- {name}(*{args!r}) returned {actual!r}, "
                 f"expected {expected!r}"
+            )
+        else:
+            logger.info(
+                "  sandbox test %s -> PASS | reason=ok | stdout=%r",
+                entry_call, actual,
             )
 
     return (len(failures) == 0, failures)
@@ -176,15 +199,31 @@ def create_tool(task_spec: dict) -> dict:
     prev_code = None
     last_failures = []
 
+    logger.info("=" * 60)
+    logger.info("create_tool() called for '%s'", name)
+    logger.info("task_spec: %s", json.dumps(task_spec, indent=2))
+
     for attempt in range(1, MAX_RETRIES + 1):
+        logger.info("-" * 60)
+        logger.info("Attempt %d/%d for '%s'", attempt, MAX_RETRIES, name)
+
         if attempt == 1:
             prompt = build_initial_prompt(task_spec)
         else:
-            prompt = build_retry_prompt(task_spec, prev_code, "\n".join(last_failures))
+            failure_report = "\n".join(last_failures)
+            logger.info("Retrying — feeding back failures:\n%s", failure_report)
+            prompt = build_retry_prompt(task_spec, prev_code, failure_report)
+
+        logger.info("Prompt sent to model (%s):\n%s", MODEL, prompt)
 
         try:
             raw = call_model(prompt)
         except RuntimeError as exc:
+            logger.info("Model call FAILED: %s", exc)
+            logger.info(
+                "create_tool() outcome: FAILURE (tool=%s, attempts=%d, error=%s)",
+                name, attempt, exc,
+            )
             return {
                 "success": False,
                 "tool_name": name,
@@ -193,11 +232,19 @@ def create_tool(task_spec: dict) -> dict:
                 "error": str(exc),
             }
 
+        logger.info("Raw response from model:\n%s", raw)
+
         code = clean_code(raw)
+        logger.info("Cleaned code:\n%s", code)
+
         passed, failures = run_tests(code, task_spec)
 
         if passed:
             save_tool(task_spec, code)
+            logger.info(
+                "create_tool() outcome: SUCCESS (tool=%s, attempts=%d)",
+                name, attempt,
+            )
             return {
                 "success": True,
                 "tool_name": name,
@@ -212,6 +259,10 @@ def create_tool(task_spec: dict) -> dict:
     error_summary = (
         f"failed after {MAX_RETRIES} attempts; last failures: "
         + "; ".join(last_failures)
+    )
+    logger.info(
+        "create_tool() outcome: FAILURE (tool=%s, attempts=%d, error=%s)",
+        name, MAX_RETRIES, error_summary,
     )
     return {
         "success": False,

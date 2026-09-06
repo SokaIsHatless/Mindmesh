@@ -155,21 +155,37 @@ export default function Home() {
   const [visibleSteps, setVisibleSteps] = useState<Step[]>([]);
   const [isRunning, setIsRunning] = useState(false);
 
-  const runAgent = () => {
+  const runAgent = async () => {
     const trimmedTask = task.trim();
     if (!trimmedTask || isRunning) return;
 
-    // -------------------------------------------------------
-    // REAL BACKEND REPLACEMENT POINT:
-    // Replace mockRun(trimmedTask) with a fetch to POST /run
-    // (or SSE) that returns Step[] in the same shape.
-    // -------------------------------------------------------
-    const generatedSteps = mockRun(trimmedTask);
+    setAllSteps([]);
+    setVisibleSteps([]);
+    setIsRunning(true);
 
-    // Show the first step immediately, then stream the rest.
-    setAllSteps(generatedSteps);
-    setVisibleSteps(generatedSteps.slice(0, 1));
-    setIsRunning(generatedSteps.length > 1);
+    try {
+      const res = await fetch("http://localhost:8000/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ task: trimmedTask }),
+      });
+      if (!res.ok) throw new Error("Backend returned " + res.status);
+      const data = await res.json();
+      const generatedSteps: Step[] = data.trace;
+
+      // Show the first step immediately, then stream the rest.
+      setAllSteps(generatedSteps);
+      setVisibleSteps(generatedSteps.slice(0, 1));
+      setIsRunning(generatedSteps.length > 1);
+    } catch {
+      const errorStep: Step = {
+        type: "fail",
+        label: "Could not reach the backend — is it running on port 8000?",
+      };
+      setAllSteps([errorStep]);
+      setVisibleSteps([errorStep]);
+      setIsRunning(false);
+    }
   };
 
   // Stream remaining steps one at a time (~600ms apart).

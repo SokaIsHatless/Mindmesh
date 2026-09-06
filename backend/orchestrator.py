@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import operator
 import re
 from datetime import datetime, timezone
@@ -12,6 +13,17 @@ from typing import Any
 
 from Sandbox import run_tool
 from tool_factory import create_tool
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logger = logging.getLogger("orchestrator")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("[orchestrator] %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -377,12 +389,20 @@ def handle_task(task: str) -> dict[str, Any]:
     trace: list[dict[str, str]] = []
     _ensure_toolbox()
 
+    logger.info("=" * 60)
+    logger.info("Incoming task: %r", task)
+
     # --- Path 1: trivial ---
     if _is_trivial(task):
+        expr_result = _answer_trivial(task)
+        logger.info(
+            "Path chosen: TRIVIAL — task is a clean arithmetic expression"
+        )
+        logger.info("  expression=%r -> result=%r", task.strip(), expr_result)
         trace.append(
             _step("plan", "This is trivial — I can answer directly")
         )
-        answer = _answer_trivial(task)
+        answer = expr_result
         trace.append(_step("answer", f"Answer: {answer}"))
         return {"answer": answer, "trace": trace}
 
@@ -399,6 +419,11 @@ def handle_task(task: str) -> dict[str, Any]:
         raw, sandbox_result, call = _run_existing_tool(match, task)
         if raw is not None:
             answer = _format_answer(match["name"], raw)
+            logger.info(
+                "Path chosen: REUSE — matched existing tool '%s'",
+                match["name"],
+            )
+            logger.info("  signature=%s | call=%s", match.get("signature"), call)
             trace[-1] = _step(
                 "check",
                 f"Found existing tool '{match['name']}' — reusing it",
@@ -407,6 +432,10 @@ def handle_task(task: str) -> dict[str, Any]:
             trace.append(_step("answer", f"Answer: {answer}"))
             return {"answer": answer, "trace": trace}
 
+        logger.info(
+            "Matched tool '%s' but sandbox run failed: reason=%s",
+            match["name"], sandbox_result.get("reason", "error"),
+        )
         trace.append(
             _step(
                 "fail",
@@ -419,14 +448,25 @@ def handle_task(task: str) -> dict[str, Any]:
     trace.append(_step("no_tool", "No tool found — writing a new one"))
 
     task_spec = _build_task_spec(task)
+    logger.info(
+        "Path chosen: FACTORY — no confident toolbox match, calling "
+        "create_tool() with task_spec: %s",
+        json.dumps(task_spec, indent=2),
+    )
     result = create_tool(task_spec)
 
     if not result.get("success"):
         err = result.get("error") or "factory failed"
+        logger.info("Factory result: FAILURE — %s", err)
         trace.append(_step("fail", f"Tool factory failed: {err}"))
         answer = f"Could not build a tool: {err}"
         trace.append(_step("answer", f"Answer: {answer}"))
         return {"answer": answer, "trace": trace}
+
+    logger.info(
+        "Factory result: SUCCESS — tool=%s, attempts=%s",
+        result.get("tool_name"), result.get("attempts"),
+    )
 
     name = result["tool_name"]
     code = result["code"]
