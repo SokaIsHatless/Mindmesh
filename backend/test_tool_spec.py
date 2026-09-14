@@ -61,6 +61,19 @@ class ToolSpecTests(unittest.TestCase):
                 output=OutputSpec(name="result", type="number"),
             )
 
+    def test_output_spec_requires_a_named_output(self) -> None:
+        output = OutputSpec(name=" result ", type="number", unit="items")
+
+        self.assertEqual(output.name, "result")
+        with self.assertRaises(ValidationError):
+            OutputSpec(type="number")
+        with self.assertRaises(ValidationError):
+            OutputSpec(name="   ", type="number")
+        with self.assertRaises(ValidationError):
+            OutputSpec(name=123, type="number")
+        with self.assertRaises(ValidationError):
+            OutputSpec(name="result", type="number", unexpected=True)
+
     def test_duplicate_input_names_are_rejected_after_normalization(self) -> None:
         with self.assertRaises(ValidationError):
             ToolSpec(

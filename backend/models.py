@@ -77,12 +77,13 @@ class InputSpec(_ToolSpecModel):
 
 
 class OutputSpec(_ToolSpecModel):
-    """The declared value type and optional unit of a capability result."""
+    """The named value type and optional unit of a capability result."""
 
+    name: str
     type: ToolValueType
     unit: str | None = None
 
-    @field_validator("type", mode="before")
+    @field_validator("name", "type", mode="before")
     @classmethod
     def validate_required_text(cls, value: Any, info: ValidationInfo):
         return _nonblank_text(value, info.field_name)
