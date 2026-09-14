@@ -11,8 +11,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from Sandbox import run_tool
-from tool_factory import create_tool
+from .models import InputSpec, OutputSpec, TestCase, ToolSpec
+from .Sandbox import run_tool
+from .tool_factory import create_tool
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -298,52 +299,97 @@ def _is_well_defined_request(task: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Task -> factory spec / run args
+# Task -> ToolSpec -> legacy factory spec / run args
 # ---------------------------------------------------------------------------
 def _slug_tool_name(task: str) -> str:
     words = re.findall(r"[a-z0-9]+", task.lower())[:4]
     return "_".join(words)[:32] or "custom_tool"
 
 
-def _build_task_spec(task: str) -> dict:
-    """Build create_tool contract from a clear computational request."""
+def _build_tool_spec(task: str) -> ToolSpec:
+    """Describe a clear computational request without prescribing execution."""
     name = _intended_tool_name(task) or _slug_tool_name(task)
-    description = task.strip()
+    purpose = task.strip()
 
     if name == "speed":
-        return {
-            "name": "speed",
-            "description": description,
-            "inputs": ["distance_km", "time_hr"],
-            "tests": [{"args": [120, 2], "expected": 60}],
-        }
+        return ToolSpec(
+            name="speed",
+            purpose=purpose,
+            inputs=[
+                InputSpec(name="distance_km", type="float", unit="km"),
+                InputSpec(name="time_hr", type="float", unit="hr"),
+            ],
+            outputs=[OutputSpec(name="speed_kmh", type="number", unit="km/h")],
+            constraints=["time_hr must not be zero"],
+            examples=[
+                TestCase(input={"distance_km": 120, "time_hr": 2}, expected=60)
+            ],
+        )
     if name == "distance":
-        return {
-            "name": "distance",
-            "description": description,
-            "inputs": ["speed_kmh", "time_hr"],
-            "tests": [{"args": [60, 2], "expected": 120}],
-        }
+        return ToolSpec(
+            name="distance",
+            purpose=purpose,
+            inputs=[
+                InputSpec(name="speed_kmh", type="float", unit="km/h"),
+                InputSpec(name="time_hr", type="float", unit="hr"),
+            ],
+            outputs=[OutputSpec(name="distance_km", type="number", unit="km")],
+            examples=[TestCase(input={"speed_kmh": 60, "time_hr": 2}, expected=120)],
+        )
     if name == "time":
-        return {
-            "name": "time",
-            "description": description,
-            "inputs": ["distance_km", "speed_kmh"],
-            "tests": [{"args": [120, 60], "expected": 2}],
-        }
+        return ToolSpec(
+            name="time",
+            purpose=purpose,
+            inputs=[
+                InputSpec(name="distance_km", type="float", unit="km"),
+                InputSpec(name="speed_kmh", type="float", unit="km/h"),
+            ],
+            outputs=[OutputSpec(name="time_hr", type="number", unit="hr")],
+            constraints=["speed_kmh must not be zero"],
+            examples=[
+                TestCase(input={"distance_km": 120, "speed_kmh": 60}, expected=2)
+            ],
+        )
     if name == "probability":
-        return {
-            "name": "probability",
-            "description": description,
-            "inputs": ["favorable", "total"],
-            "tests": [{"args": [13, 52], "expected": 0.25}],
-        }
+        return ToolSpec(
+            name="probability",
+            purpose=purpose,
+            inputs=[
+                InputSpec(name="favorable", type="number"),
+                InputSpec(name="total", type="number"),
+            ],
+            outputs=[OutputSpec(name="probability", type="number")],
+            constraints=["total must not be zero", "probability must be between 0 and 1"],
+            examples=[TestCase(input={"favorable": 13, "total": 52}, expected=0.25)],
+        )
 
+    return ToolSpec(
+        name=name,
+        purpose=purpose,
+        inputs=[InputSpec(name="x", type="number")],
+        outputs=[OutputSpec(name="result", type="number")],
+        examples=[TestCase(input={"x": 1}, expected=1)],
+    )
+
+
+def _tool_spec_to_factory_task_spec(spec: ToolSpec) -> dict[str, Any]:
+    """Adapt the pure capability contract to the unchanged factory interface."""
+    input_names = [input_spec.name for input_spec in spec.inputs]
+    tests = [
+        {
+            "args": [
+                example.input.get(input_spec.name, input_spec.default)
+                for input_spec in spec.inputs
+            ],
+            "expected": example.expected,
+        }
+        for example in spec.examples
+    ]
     return {
-        "name": name,
-        "description": description,
-        "inputs": ["x"],
-        "tests": [{"args": [1], "expected": 1}],
+        "name": spec.name,
+        "description": spec.purpose,
+        "inputs": input_names,
+        "tests": tests,
     }
 
 
@@ -507,7 +553,8 @@ def handle_task(task: str) -> dict[str, Any]:
     # --- Path 3: create via factory ---
     trace.append(_step("no_tool", "No tool found — writing a new one"))
 
-    task_spec = _build_task_spec(task)
+    tool_spec = _build_tool_spec(task)
+    task_spec = _tool_spec_to_factory_task_spec(tool_spec)
     logger.info(
         "Path chosen: FACTORY — no confident toolbox match, calling "
         "create_tool() with task_spec: %s",
@@ -530,7 +577,12 @@ def handle_task(task: str) -> dict[str, Any]:
 
     name = result["tool_name"]
     code = result["code"]
-    entry = _save_tool(name, code, task_spec["description"], task_spec["inputs"])
+    entry = _save_tool(
+        name,
+        code,
+        tool_spec.purpose,
+        [input_spec.name for input_spec in tool_spec.inputs],
+    )
 
     trace.append(
         _step("writing", "Writing a Python tool", detail=code)
