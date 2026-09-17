@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 try:  # Supports ``backend.capabilities`` package and backend test discovery.
     from .models import Capability
@@ -24,16 +26,46 @@ class CapabilityRepository:
             else Path(__file__).resolve().parent / "capabilities.sqlite3"
         )
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self._closed = False
         self._initialize_schema()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.database_path)
+        if self._closed:
+            raise RuntimeError("CapabilityRepository is closed")
+        connection = sqlite3.connect(str(self.database_path))
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        """Open a connection, commit/rollback the transaction, then always close.
+
+        ``sqlite3.Connection`` as a context manager only commits or rolls back;
+        it does **not** close the connection. Leaving it open keeps the database
+        file locked on Windows and breaks temporary-directory cleanup.
+        """
+        connection = self._connect()
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def close(self) -> None:
+        """Mark the repository closed. Safe to call more than once.
+
+        Connections are opened per operation and closed before each method
+        returns; ``close`` exists so callers (and tests) can end the lifecycle
+        explicitly before deleting the database file on Windows.
+        """
+        self._closed = True
+
     def _initialize_schema(self) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS capabilities (
@@ -104,7 +136,7 @@ class CapabilityRepository:
     def register(self, capability: Capability) -> Capability:
         """Atomically upsert one capability and replace its aliases."""
         record = self._to_record(capability)
-        with self._connect() as connection:
+        with self._connection() as connection:
             for alias in capability.aliases:
                 owner = connection.execute(
                     """
@@ -181,7 +213,7 @@ class CapabilityRepository:
         ]
 
     def get_by_operation(self, operation: str) -> list[Capability]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM capabilities WHERE operation = ?
@@ -192,7 +224,7 @@ class CapabilityRepository:
             return self._capabilities_from_rows(connection, rows)
 
     def get_by_alias(self, alias: str) -> Capability | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 """
                 SELECT capabilities.* FROM capabilities
@@ -210,7 +242,7 @@ class CapabilityRepository:
             )
 
     def get_version(self, tool_id: str, version: str) -> Capability | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM capabilities WHERE tool_id = ? AND version = ?",
                 (tool_id, version),
@@ -222,7 +254,7 @@ class CapabilityRepository:
             )
 
     def list_capabilities(self, enabled: bool | None = None) -> list[Capability]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             if enabled is None:
                 rows = connection.execute(
                     "SELECT * FROM capabilities ORDER BY tool_id, version"

@@ -24,6 +24,7 @@ class CapabilityRegistryTests(unittest.TestCase):
         self.registry = CapabilityRegistry(self.database_path)
 
     def tearDown(self) -> None:
+        self.registry.close()
         self._temporary_directory.cleanup()
 
     def _tool_file(self, name: str) -> str:
@@ -139,10 +140,39 @@ class CapabilityRegistryTests(unittest.TestCase):
     def test_data_persists_across_registry_instances(self) -> None:
         capability = self.registry.register(self._speed_capability())
         reopened = CapabilityRegistry(self.database_path)
+        try:
+            self.assertEqual(
+                reopened.get_version(capability.tool_id, capability.version),
+                capability,
+            )
+        finally:
+            reopened.close()
 
-        self.assertEqual(
-            reopened.get_version(capability.tool_id, capability.version), capability
-        )
+    def test_closed_registry_releases_sqlite_file_for_deletion(self) -> None:
+        """Windows must be able to delete the DB after the registry is closed."""
+        isolated = tempfile.TemporaryDirectory()
+        try:
+            root = Path(isolated.name)
+            database_path = root / "capabilities.sqlite3"
+            tool_path = root / "speed.py"
+            tool_path.write_text(
+                "def placeholder():\n    return None\n", encoding="utf-8"
+            )
+            registry = CapabilityRegistry(database_path)
+            registry.register(
+                Capability.from_tool_spec(
+                    self._speed_spec(),
+                    version="1.0.0",
+                    code_path=str(tool_path),
+                    aliases=["velocity"],
+                )
+            )
+            self.assertTrue(database_path.is_file())
+            registry.close()
+            database_path.unlink()
+            self.assertFalse(database_path.exists())
+        finally:
+            isolated.cleanup()
 
     def test_bmi_and_speed_use_the_same_generic_metadata_structure(self) -> None:
         speed = self.registry.register(self._speed_capability())

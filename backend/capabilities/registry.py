@@ -18,6 +18,17 @@ class CapabilityRegistry:
     def __init__(self, database_path: str | Path | None = None) -> None:
         self._repository = CapabilityRepository(database_path)
 
+    def close(self) -> None:
+        """Release registry resources. Safe to call more than once."""
+        self._repository.close()
+
+    def __enter__(self) -> "CapabilityRegistry":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
     def register(self, capability: Capability) -> Capability:
         if not isinstance(capability, Capability):
             raise TypeError("capability must be a Capability")
