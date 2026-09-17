@@ -1,10 +1,15 @@
 """
-The real Tool Factory. Generates a pure Python function for a task via a
-local Ollama model, tests it in the sandbox, retries on failure, and saves
-passing tools to backend/toolbox/.
+The Tool Factory. Generates a pure Python function from a ToolSpec via a
+local Ollama model, tests it in the sandbox against ToolSpec.examples,
+retries on failure, and saves passing tools to backend/toolbox/.
+
+Primary input is ``ToolSpec``. A temporary legacy ``task_spec`` dict adapter
+is isolated below for backward compatibility with the current orchestrator.
 
 Run standalone from backend/:  py tool_factory.py
 """
+
+from __future__ import annotations
 
 import datetime
 import json
@@ -13,8 +18,12 @@ import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Any
+
+from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from models import InputSpec, OutputSpec, TestCase, ToolSpec
 from Sandbox import run_tool
 
 # --- Logging ---
@@ -72,31 +81,76 @@ def clean_code(raw: str) -> str:
     return code
 
 
-def build_signature(name: str, inputs: list) -> str:
+def build_signature(name: str, inputs: list[str]) -> str:
     return f"{name}({', '.join(inputs)})"
 
 
-def build_initial_prompt(task_spec: dict) -> str:
-    name = task_spec["name"]
-    signature = build_signature(name, task_spec["inputs"])
+def _input_names(tool_spec: ToolSpec) -> list[str]:
+    return [input_spec.name for input_spec in tool_spec.inputs]
+
+
+def _format_input_contract(tool_spec: ToolSpec) -> str:
+    parts: list[str] = []
+    for input_spec in tool_spec.inputs:
+        detail = f"{input_spec.name}: {input_spec.type}"
+        if input_spec.unit:
+            detail += f" ({input_spec.unit})"
+        if input_spec.description:
+            detail += f" — {input_spec.description}"
+        if not input_spec.required:
+            detail += " [optional]"
+        parts.append(detail)
+    return "; ".join(parts) if parts else "(none)"
+
+
+def _format_output_contract(tool_spec: ToolSpec) -> str:
+    output = tool_spec.output
+    detail = f"{output.name}: {output.type}"
+    if output.unit:
+        detail += f" ({output.unit})"
+    return detail
+
+
+def _allowed_imports_for(tool_spec: ToolSpec) -> str:
+    if tool_spec.allowed_dependencies:
+        return ", ".join(tool_spec.allowed_dependencies)
+    return ALLOWED_IMPORTS
+
+
+def build_initial_prompt(tool_spec: ToolSpec) -> str:
+    """Build a generic generation prompt from ToolSpec metadata only."""
+    name = tool_spec.name
+    signature = build_signature(name, _input_names(tool_spec))
+    constraints = (
+        "; ".join(tool_spec.constraints) if tool_spec.constraints else "none"
+    )
     return (
         f"Write a pure Python function named `{name}` with signature "
-        f"{signature} that {task_spec['description']}. "
+        f"{signature} that {tool_spec.purpose}. "
+        f"Inputs: {_format_input_contract(tool_spec)}. "
+        f"Output: {_format_output_contract(tool_spec)}. "
+        f"Constraints/requirements: {constraints}. "
         "Return ONLY the raw Python code for the function. "
         "Do not include any explanation, comments, markdown code fences, "
         "or example usage — just the function definition. "
         "Only use built-in Python (no imports) unless absolutely "
-        f"necessary; if you must import, only use: {ALLOWED_IMPORTS}."
+        f"necessary; if you must import, only use: {_allowed_imports_for(tool_spec)}."
     )
 
 
-def build_retry_prompt(task_spec: dict, prev_code: str, failure_report: str) -> str:
-    name = task_spec["name"]
-    signature = build_signature(name, task_spec["inputs"])
+def build_retry_prompt(
+    tool_spec: ToolSpec, prev_code: str, failure_report: str
+) -> str:
+    name = tool_spec.name
+    signature = build_signature(name, _input_names(tool_spec))
     return (
         "You previously wrote this Python function for the task below, "
         "but it failed testing. Fix the function.\n\n"
-        f"Task: {signature} — {task_spec['description']}\n\n"
+        f"Task: {signature} — {tool_spec.purpose}\n"
+        f"Inputs: {_format_input_contract(tool_spec)}\n"
+        f"Output: {_format_output_contract(tool_spec)}\n"
+        f"Constraints/requirements: "
+        f"{'; '.join(tool_spec.constraints) if tool_spec.constraints else 'none'}\n\n"
         "Your previous code:\n"
         f"{prev_code}\n\n"
         "Test failures:\n"
@@ -107,7 +161,7 @@ def build_retry_prompt(task_spec: dict, prev_code: str, failure_report: str) -> 
     )
 
 
-def _values_match(expected, stdout_str: str) -> bool:
+def _values_match(expected: Any, stdout_str: str) -> bool:
     stdout_str = stdout_str.strip()
     try:
         expected_f = float(expected)
@@ -118,13 +172,36 @@ def _values_match(expected, stdout_str: str) -> bool:
     return stdout_str == str(expected).strip()
 
 
-def run_tests(code: str, task_spec: dict) -> tuple:
-    name = task_spec["name"]
-    failures = []
+def _example_args(tool_spec: ToolSpec, example: TestCase) -> list[Any]:
+    """Positional args in ToolSpec input order (generic; no operation branches)."""
+    args: list[Any] = []
+    for input_spec in tool_spec.inputs:
+        if input_spec.name in example.inputs:
+            args.append(example.inputs[input_spec.name])
+        elif not input_spec.required:
+            args.append(input_spec.default)
+        else:
+            raise ValueError(
+                f"example is missing required input '{input_spec.name}'"
+            )
+    return args
 
-    for test in task_spec["tests"]:
-        args = test["args"]
-        expected = test["expected"]
+
+def run_tests(code: str, tool_spec: ToolSpec) -> tuple[bool, list[str]]:
+    """Exercise generated code against ToolSpec.examples via the sandbox."""
+    name = tool_spec.name
+    failures: list[str] = []
+
+    if not tool_spec.examples:
+        # Verification pipeline / independent test generation is a later milestone.
+        # With no examples, accept generation if the sandbox can import/call nothing
+        # further — treat as vacuously passed so generation can still complete.
+        logger.info("No ToolSpec.examples provided; skipping sandbox tests")
+        return True, []
+
+    for example in tool_spec.examples:
+        args = _example_args(tool_spec, example)
+        expected = example.expected
         entry_call = f"print({name}(*{args!r}))"
         result = run_tool(code, entry_call)
 
@@ -132,7 +209,10 @@ def run_tests(code: str, task_spec: dict) -> tuple:
             stderr_snippet = result["stderr"].strip()[-300:]
             logger.info(
                 "  sandbox test %s -> FAIL | reason=%s | stdout=%r | stderr=%r",
-                entry_call, result["reason"], result.get("stdout", ""), stderr_snippet,
+                entry_call,
+                result["reason"],
+                result.get("stdout", ""),
+                stderr_snippet,
             )
             failures.append(
                 f"- {name}(*{args!r}) failed to run: {result['reason']} "
@@ -144,7 +224,9 @@ def run_tests(code: str, task_spec: dict) -> tuple:
         if not _values_match(expected, actual):
             logger.info(
                 "  sandbox test %s -> FAIL | reason=ok | got=%r | expected=%r",
-                entry_call, actual, expected,
+                entry_call,
+                actual,
+                expected,
             )
             failures.append(
                 f"- {name}(*{args!r}) returned {actual!r}, "
@@ -153,7 +235,8 @@ def run_tests(code: str, task_spec: dict) -> tuple:
         else:
             logger.info(
                 "  sandbox test %s -> PASS | reason=ok | stdout=%r",
-                entry_call, actual,
+                entry_call,
+                actual,
             )
 
     return (len(failures) == 0, failures)
@@ -176,9 +259,9 @@ def _save_manifest(entries: list) -> None:
     tmp_path.replace(MANIFEST_PATH)
 
 
-def save_tool(task_spec: dict, code: str) -> None:
+def save_tool(tool_spec: ToolSpec, code: str) -> None:
     TOOLBOX_DIR.mkdir(parents=True, exist_ok=True)
-    name = task_spec["name"]
+    name = tool_spec.name
     (TOOLBOX_DIR / f"{name}.py").write_text(code, encoding="utf-8")
 
     entries = _load_manifest()
@@ -186,33 +269,130 @@ def save_tool(task_spec: dict, code: str) -> None:
     entries.append(
         {
             "name": name,
-            "signature": build_signature(name, task_spec["inputs"]),
-            "description": task_spec["description"],
+            "signature": build_signature(name, _input_names(tool_spec)),
+            "description": tool_spec.purpose,
             "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
         }
     )
     _save_manifest(entries)
 
 
-def create_tool(task_spec: dict) -> dict:
-    name = task_spec["name"]
+# ---------------------------------------------------------------------------
+# Legacy task_spec adapter (temporary, isolated)
+# ---------------------------------------------------------------------------
+# The orchestrator still converts ToolSpec → old dict and calls create_tool(dict).
+# Keep that path working here without leaking dict-shaped logic into prompts/tests.
+
+
+def _is_legacy_task_spec(value: dict[str, Any]) -> bool:
+    """Detect the pre-ToolSpec factory dict: string input names + description."""
+    inputs = value.get("inputs")
+    return (
+        isinstance(value.get("name"), str)
+        and isinstance(value.get("description"), str)
+        and isinstance(inputs, list)
+        and (len(inputs) == 0 or isinstance(inputs[0], str))
+        and "purpose" not in value
+    )
+
+
+def adapt_legacy_task_spec(task_spec: dict[str, Any]) -> ToolSpec:
+    """Convert the old orchestrator task_spec dict into a ToolSpec.
+
+    Isolated adapter — do not use this shape inside prompt/test helpers.
+    """
+    if not isinstance(task_spec, dict):
+        raise TypeError("legacy task_spec must be a dict")
+
+    raw_inputs = task_spec.get("inputs")
+    if not isinstance(raw_inputs, list) or not all(
+        isinstance(name, str) for name in raw_inputs
+    ):
+        raise ValueError("legacy task_spec inputs must be a list of strings")
+
+    input_specs = [InputSpec(name=name, type="number") for name in raw_inputs]
+    examples: list[TestCase] = []
+    for test in task_spec.get("tests") or []:
+        if not isinstance(test, dict) or "args" not in test or "expected" not in test:
+            raise ValueError("legacy tests must be {args, expected} mappings")
+        args = test["args"]
+        if not isinstance(args, list) or len(args) != len(input_specs):
+            raise ValueError(
+                "legacy test args length must match the number of inputs"
+            )
+        examples.append(
+            TestCase(
+                inputs={
+                    input_spec.name: args[index]
+                    for index, input_spec in enumerate(input_specs)
+                },
+                expected=test["expected"],
+            )
+        )
+
+    return ToolSpec(
+        name=task_spec["name"],
+        purpose=task_spec["description"],
+        inputs=input_specs,
+        output=OutputSpec(name="result", type="number"),
+        examples=examples,
+    )
+
+
+def coerce_tool_spec(value: ToolSpec | dict[str, Any]) -> ToolSpec:
+    """Accept ToolSpec, ToolSpec-shaped dict, or isolated legacy task_spec."""
+    if isinstance(value, ToolSpec):
+        return value
+    if not isinstance(value, dict):
+        raise TypeError("tool_spec must be a ToolSpec or dict")
+    if _is_legacy_task_spec(value):
+        return adapt_legacy_task_spec(value)
+    return ToolSpec.model_validate(value)
+
+
+def create_tool(tool_spec: ToolSpec | dict[str, Any]) -> dict:
+    """Generate, sandbox-test, and save a tool from a ToolSpec.
+
+    Also accepts the legacy task_spec dict via ``adapt_legacy_task_spec`` so the
+    current orchestrator keeps working until it is switched to ToolSpec directly.
+    """
+    try:
+        spec = coerce_tool_spec(tool_spec)
+    except (TypeError, ValueError, ValidationError, KeyError) as exc:
+        name = None
+        if isinstance(tool_spec, dict):
+            raw_name = tool_spec.get("name")
+            if isinstance(raw_name, str) and raw_name.strip():
+                name = raw_name.strip()
+        elif isinstance(tool_spec, ToolSpec):
+            name = tool_spec.name
+        logger.info("create_tool() rejected invalid tool spec: %s", exc)
+        return {
+            "success": False,
+            "tool_name": name or "",
+            "code": "",
+            "attempts": 0,
+            "error": f"invalid tool spec: {exc}",
+        }
+
+    name = spec.name
     prev_code = None
-    last_failures = []
+    last_failures: list[str] = []
 
     logger.info("=" * 60)
     logger.info("create_tool() called for '%s'", name)
-    logger.info("task_spec: %s", json.dumps(task_spec, indent=2))
+    logger.info("tool_spec: %s", spec.model_dump_json(indent=2))
 
     for attempt in range(1, MAX_RETRIES + 1):
         logger.info("-" * 60)
         logger.info("Attempt %d/%d for '%s'", attempt, MAX_RETRIES, name)
 
         if attempt == 1:
-            prompt = build_initial_prompt(task_spec)
+            prompt = build_initial_prompt(spec)
         else:
             failure_report = "\n".join(last_failures)
             logger.info("Retrying — feeding back failures:\n%s", failure_report)
-            prompt = build_retry_prompt(task_spec, prev_code, failure_report)
+            prompt = build_retry_prompt(spec, prev_code or "", failure_report)
 
         logger.info("Prompt sent to model (%s):\n%s", MODEL, prompt)
 
@@ -222,7 +402,9 @@ def create_tool(task_spec: dict) -> dict:
             logger.info("Model call FAILED: %s", exc)
             logger.info(
                 "create_tool() outcome: FAILURE (tool=%s, attempts=%d, error=%s)",
-                name, attempt, exc,
+                name,
+                attempt,
+                exc,
             )
             return {
                 "success": False,
@@ -237,13 +419,14 @@ def create_tool(task_spec: dict) -> dict:
         code = clean_code(raw)
         logger.info("Cleaned code:\n%s", code)
 
-        passed, failures = run_tests(code, task_spec)
+        passed, failures = run_tests(code, spec)
 
         if passed:
-            save_tool(task_spec, code)
+            save_tool(spec, code)
             logger.info(
                 "create_tool() outcome: SUCCESS (tool=%s, attempts=%d)",
-                name, attempt,
+                name,
+                attempt,
             )
             return {
                 "success": True,
@@ -262,7 +445,9 @@ def create_tool(task_spec: dict) -> dict:
     )
     logger.info(
         "create_tool() outcome: FAILURE (tool=%s, attempts=%d, error=%s)",
-        name, MAX_RETRIES, error_summary,
+        name,
+        MAX_RETRIES,
+        error_summary,
     )
     return {
         "success": False,
@@ -273,6 +458,23 @@ def create_tool(task_spec: dict) -> dict:
     }
 
 
+DEMO_TOOL_SPEC = ToolSpec(
+    name="speed",
+    purpose="compute speed from distance and time",
+    inputs=[
+        InputSpec(name="distance_km", type="float", unit="km"),
+        InputSpec(name="time_hr", type="float", unit="hr"),
+    ],
+    output=OutputSpec(name="speed_kmh", type="number", unit="km/h"),
+    constraints=["time_hr must not be zero"],
+    examples=[
+        TestCase(inputs={"distance_km": 120, "time_hr": 2}, expected=60),
+        TestCase(inputs={"distance_km": 90, "time_hr": 3}, expected=30),
+    ],
+    allowed_dependencies=["math"],
+)
+
+# Backward-compatible alias for standalone demos that still mention task_spec.
 DEMO_TASK_SPEC = {
     "name": "speed",
     "description": "compute speed from distance and time",
@@ -305,7 +507,7 @@ def _self_test_retry() -> None:
 
     call_model = fake_call_model
     try:
-        result = create_tool(DEMO_TASK_SPEC)
+        result = create_tool(DEMO_TOOL_SPEC)
     finally:
         call_model = real_call_model
 
@@ -319,5 +521,5 @@ if __name__ == "__main__":
     if "--self-test-retry" in sys.argv:
         _self_test_retry()
     else:
-        result = create_tool(DEMO_TASK_SPEC)
+        result = create_tool(DEMO_TOOL_SPEC)
         print(json.dumps(result, indent=2))
