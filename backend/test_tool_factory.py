@@ -9,14 +9,27 @@ from unittest.mock import patch
 
 from pydantic import ValidationError
 
-import tool_factory
-from models import InputSpec, OutputSpec, TestCase, ToolSpec
-from tool_factory import (
-    adapt_legacy_task_spec,
-    build_initial_prompt,
-    coerce_tool_spec,
-    create_tool,
-)
+try:
+    # Package form: ``py -m unittest backend.test_tool_factory``
+    # Import tool_factory first so it places ``backend/`` on sys.path; then use
+    # the same flat ``models`` import the factory uses (one ToolSpec class).
+    from . import tool_factory
+    from .tool_factory import (
+        adapt_legacy_task_spec,
+        build_initial_prompt,
+        coerce_tool_spec,
+        create_tool,
+    )
+    from models import InputSpec, OutputSpec, TestCase, ToolSpec
+except ImportError:  # Supports ``unittest discover -s backend``.
+    import tool_factory
+    from tool_factory import (
+        adapt_legacy_task_spec,
+        build_initial_prompt,
+        coerce_tool_spec,
+        create_tool,
+    )
+    from models import InputSpec, OutputSpec, TestCase, ToolSpec
 
 
 class ToolFactoryToolSpecTests(unittest.TestCase):

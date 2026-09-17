@@ -22,9 +22,13 @@ from typing import Any
 
 from pydantic import ValidationError
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from models import InputSpec, OutputSpec, TestCase, ToolSpec
-from Sandbox import run_tool
+# Support ``backend.tool_factory`` and flat ``python tool_factory.py`` / discover.
+_BACKEND_DIR = str(Path(__file__).resolve().parent)
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
+from models import InputSpec, OutputSpec, TestCase, ToolSpec  # noqa: E402
+from Sandbox import run_tool  # noqa: E402
 
 # --- Logging ---
 logger = logging.getLogger("tool_factory")
