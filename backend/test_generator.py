@@ -252,27 +252,40 @@ def build_generation_prompt(tool_spec: ToolSpec) -> str:
         + "\nKnown examples (do not contradict these inputs):\n"
         + json.dumps(examples_blob, indent=2)
         + "\n\nReturn ONLY a JSON object of the form:\n"
-        '{\n  "tests": [\n'
+        "{\n"
+        '  "tests": [\n'
         "    {\n"
         '      "inputs": { ... },\n'
-        '      "category": "valid" | "boundary" | "constraint_invalid",\n'
-        '      "constraint": null or an EXACT string from the Constraints '
-        "JSON array above\n"
+        '      "category": "valid",\n'
+        '      "constraint": null\n'
+        "    },\n"
+        "    {\n"
+        '      "inputs": { ... },\n'
+        '      "category": "boundary",\n'
+        '      "constraint": null\n'
+        "    },\n"
+        "    {\n"
+        '      "inputs": { ... },\n'
+        '      "category": "constraint_invalid",\n'
+        '      "constraint": "<exact string from Constraints JSON array>"\n'
         "    }\n"
-        "  ]\n}\n"
+        "  ]\n"
+        "}\n"
         "Rules:\n"
         "- Propose additional valid, boundary, and constraint_invalid cases "
         "when the ToolSpec supports them.\n"
         "- Use ONLY declared input names.\n"
         "- Include every required input.\n"
-        "- Do NOT invent or include expected outputs.\n"
-        "- For constraint_invalid, the constraint field MUST be copied "
-        "verbatim from the Constraints JSON array above. Never paraphrase, "
-        "rewrite, shorten, expand, or invent constraint text "
+        "- For category \"valid\" or \"boundary\", constraint MUST be null "
+        "(or omit the field). Never attach a constraint string to valid or "
+        "boundary tests.\n"
+        "- For category \"constraint_invalid\", constraint MUST be set to an "
+        "EXACT string copied verbatim from the Constraints JSON array above. "
+        "Never paraphrase, rewrite, shorten, expand, or invent constraint text "
         '(e.g. do not change "must not be zero" into "must be positive").\n'
         "- constraint_invalid inputs MUST demonstrably violate that exact "
         "constraint (e.g. for \"time_hr must not be zero\", time_hr must be 0). "
-        "Do not attach a constraint label to inputs that satisfy it.\n"
+        "Do not label inputs that satisfy the constraint as constraint_invalid.\n"
         "- Do NOT invent or infer new constraints that are not listed.\n"
         "- If Constraints is an empty array [], do not emit "
         "constraint_invalid cases.\n"
@@ -312,6 +325,23 @@ def _normalize_candidates(payload: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(tests, list):
         raise ValueError("'tests' must be a list")
     return tests
+
+
+def _assert_constraint_field_rules(
+    index: int, category: TestCategory, constraint: str | None
+) -> None:
+    """Enforce constraint nullability before deeper semantic checks."""
+    if category in {"valid", "boundary"} and constraint is not None:
+        raise ValueError(
+            f"tests[{index}] may only set constraint for constraint_invalid "
+            f"cases (category={category!r} requires constraint=null)"
+        )
+    if category == "constraint_invalid" and constraint is None:
+        raise ValueError(
+            f"tests[{index}] is constraint_invalid but constraint is null; "
+            "every constraint_invalid test must reference an exact "
+            "ToolSpec.constraints entry"
+        )
 
 
 def _resolve_expectation(
@@ -456,6 +486,10 @@ def validate_and_build_tests(
         except Exception as exc:
             raise ValueError(f"tests[{index}] malformed: {exc}") from exc
 
+        _assert_constraint_field_rules(
+            index, candidate.category, candidate.constraint
+        )
+
         inputs = _validate_inputs_against_spec(candidate.inputs, tool_spec)
         fingerprint = _inputs_fingerprint(inputs)
         if fingerprint in seen:
@@ -482,11 +516,6 @@ def validate_and_build_tests(
                     f"{candidate.constraint!r} but inputs {inputs!r} "
                     f"do not violate that constraint"
                 )
-        elif candidate.constraint is not None:
-            raise ValueError(
-                f"tests[{index}] may only set constraint for "
-                "constraint_invalid cases"
-            )
 
         if candidate.category == "boundary":
             if not _boundary_values_from_tool_spec(tool_spec):

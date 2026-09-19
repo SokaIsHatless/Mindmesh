@@ -236,6 +236,93 @@ class TestGeneratorTests(unittest.TestCase):
             )
         self.assertIn("no constraint-derived boundaries", str(ctx2.exception))
 
+    def test_valid_test_with_constraint_null_is_accepted(self) -> None:
+        raw = [
+            {
+                "inputs": {"distance_km": 50.0, "time_hr": 2.0},
+                "category": "valid",
+                "constraint": None,
+            }
+        ]
+        tests = validate_and_build_tests(raw, self._speed_spec())
+        added = [
+            item
+            for item in tests
+            if item.category == "valid" and item.inputs["distance_km"] == 50.0
+        ][0]
+        self.assertIsNone(added.constraint)
+        self.assertEqual(added.expectation_status, "unknown")
+        self.assertIsNone(added.expected)
+
+    def test_boundary_test_with_constraint_null_is_accepted(self) -> None:
+        raw = [
+            {
+                "inputs": {"distance_km": 10.0, "time_hr": 0.0},
+                "category": "boundary",
+                "constraint": None,
+            }
+        ]
+        tests = validate_and_build_tests(raw, self._speed_spec())
+        added = [item for item in tests if item.category == "boundary"][0]
+        self.assertIsNone(added.constraint)
+        self.assertEqual(added.expectation_status, "unknown")
+
+    def test_valid_or_boundary_with_constraint_is_rejected(self) -> None:
+        for category in ("valid", "boundary"):
+            with self.subTest(category=category):
+                inputs = (
+                    {"distance_km": 10.0, "time_hr": 0.0}
+                    if category == "boundary"
+                    else {"distance_km": 50.0, "time_hr": 2.0}
+                )
+                raw = [
+                    {
+                        "inputs": inputs,
+                        "category": category,
+                        "constraint": "time_hr must not be zero",
+                    }
+                ]
+                with self.assertRaises(ValueError) as ctx:
+                    validate_and_build_tests(raw, self._speed_spec())
+                self.assertIn("may only set constraint", str(ctx.exception))
+                self.assertIn("constraint=null", str(ctx.exception))
+
+    def test_constraint_invalid_exact_and_violating_is_accepted(self) -> None:
+        raw = [
+            {
+                "inputs": {"distance_km": 10.0, "time_hr": 0.0},
+                "category": "constraint_invalid",
+                "constraint": "time_hr must not be zero",
+            }
+        ]
+        tests = validate_and_build_tests(raw, self._speed_spec())
+        invalid = [item for item in tests if item.category == "constraint_invalid"]
+        self.assertEqual(len(invalid), 1)
+        self.assertEqual(invalid[0].constraint, "time_hr must not be zero")
+        self.assertEqual(invalid[0].expectation_status, "unknown")
+        self.assertIsNone(invalid[0].expected)
+
+    def test_constraint_invalid_non_violating_inputs_are_rejected(self) -> None:
+        raw = [
+            {
+                "inputs": {"distance_km": 0.0, "time_hr": 1.0},
+                "category": "constraint_invalid",
+                "constraint": "time_hr must not be zero",
+            }
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            validate_and_build_tests(raw, self._speed_spec())
+        self.assertIn("do not violate", str(ctx.exception))
+
+    def test_prompt_requires_constraint_null_for_valid_and_boundary(self) -> None:
+        prompt = build_generation_prompt(self._speed_spec())
+        self.assertIn('"category": "valid"', prompt)
+        self.assertIn('"category": "boundary"', prompt)
+        self.assertIn("constraint MUST be null", prompt)
+        self.assertIn(
+            "Never attach a constraint string to valid or boundary", prompt
+        )
+
     def test_generate_tests_success_with_mocked_model(self) -> None:
         payload = {
             "tests": [
