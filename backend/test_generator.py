@@ -228,11 +228,12 @@ def build_generation_prompt(tool_spec: ToolSpec) -> str:
             line += f", description={spec.description}"
         input_lines.append(line)
 
-    constraints = tool_spec.constraints or ["(none stated)"]
+    constraints = list(tool_spec.constraints)
     examples_blob = [
         {"inputs": example.inputs, "expected": example.expected}
         for example in tool_spec.examples
     ]
+    constraints_blob = json.dumps(constraints, indent=2)
 
     return (
         "You generate independent verification scenarios for a computational "
@@ -245,8 +246,9 @@ def build_generation_prompt(tool_spec: ToolSpec) -> str:
         f"{f', unit={tool_spec.output.unit}' if tool_spec.output.unit else ''})\n"
         "Inputs:\n"
         + "\n".join(input_lines)
-        + "\nConstraints:\n"
-        + "\n".join(f"- {item}" for item in constraints)
+        + "\nConstraints (copy these strings VERBATIM when referencing them; "
+        "character-for-character exact match required):\n"
+        + constraints_blob
         + "\nKnown examples (do not contradict these inputs):\n"
         + json.dumps(examples_blob, indent=2)
         + "\n\nReturn ONLY a JSON object of the form:\n"
@@ -254,7 +256,8 @@ def build_generation_prompt(tool_spec: ToolSpec) -> str:
         "    {\n"
         '      "inputs": { ... },\n'
         '      "category": "valid" | "boundary" | "constraint_invalid",\n'
-        '      "constraint": null or exact constraint text if constraint_invalid\n'
+        '      "constraint": null or an EXACT string from the Constraints '
+        "JSON array above\n"
         "    }\n"
         "  ]\n}\n"
         "Rules:\n"
@@ -263,8 +266,13 @@ def build_generation_prompt(tool_spec: ToolSpec) -> str:
         "- Use ONLY declared input names.\n"
         "- Include every required input.\n"
         "- Do NOT invent or include expected outputs.\n"
-        "- For constraint_invalid, set constraint to one of the listed "
-        "constraint strings.\n"
+        "- For constraint_invalid, the constraint field MUST be copied "
+        "verbatim from the Constraints JSON array above. Never paraphrase, "
+        "rewrite, shorten, expand, or invent constraint text "
+        '(e.g. do not change "must not be zero" into "must be positive").\n'
+        "- Do NOT invent or infer new constraints that are not listed.\n"
+        "- If Constraints is an empty array [], do not emit "
+        "constraint_invalid cases.\n"
         "- Prefer diverse numeric boundaries when inputs are numeric.\n"
     )
 
@@ -349,8 +357,10 @@ def validate_and_build_tests(
                 )
             if candidate.constraint not in constraint_set:
                 raise ValueError(
-                    f"tests[{index}] references unknown constraint "
-                    f"{candidate.constraint!r}"
+                    f"tests[{index}] references constraint "
+                    f"{candidate.constraint!r} which is not an exact "
+                    f"entry in ToolSpec.constraints; paraphrases and "
+                    f"invented constraints are rejected"
                 )
         elif candidate.constraint is not None:
             raise ValueError(

@@ -141,6 +141,27 @@ class TestGeneratorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_and_build_tests(bad, self._speed_spec())
 
+    def test_paraphrased_constraint_time_hr_must_be_positive_is_rejected(
+        self,
+    ) -> None:
+        """Regression: LLM must not rewrite ToolSpec constraint text."""
+        prompt = build_generation_prompt(self._speed_spec())
+        self.assertIn("copy these strings VERBATIM", prompt)
+        self.assertIn("Never paraphrase", prompt)
+        self.assertIn('"time_hr must not be zero"', prompt)
+
+        paraphrased = [
+            {
+                "inputs": {"distance_km": 10.0, "time_hr": 0.0},
+                "category": "constraint_invalid",
+                "constraint": "time_hr must be positive",
+            }
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            validate_and_build_tests(paraphrased, self._speed_spec())
+        self.assertIn("time_hr must be positive", str(ctx.exception))
+        self.assertIn("exact entry", str(ctx.exception))
+
     def test_boundary_and_valid_categories(self) -> None:
         raw = [
             {
