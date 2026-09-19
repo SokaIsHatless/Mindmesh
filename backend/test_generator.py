@@ -270,10 +270,19 @@ def build_generation_prompt(tool_spec: ToolSpec) -> str:
         "verbatim from the Constraints JSON array above. Never paraphrase, "
         "rewrite, shorten, expand, or invent constraint text "
         '(e.g. do not change "must not be zero" into "must be positive").\n'
+        "- constraint_invalid inputs MUST demonstrably violate that exact "
+        "constraint (e.g. for \"time_hr must not be zero\", time_hr must be 0). "
+        "Do not attach a constraint label to inputs that satisfy it.\n"
         "- Do NOT invent or infer new constraints that are not listed.\n"
         "- If Constraints is an empty array [], do not emit "
         "constraint_invalid cases.\n"
-        "- Prefer diverse numeric boundaries when inputs are numeric.\n"
+        "- Emit boundary cases ONLY for input values that are boundaries "
+        "implied by ToolSpec constraints (e.g. zero when a constraint says "
+        "an input must not be zero). Do not invent other boundary values.\n"
+        "- If no constraint-defined boundaries exist, do not emit boundary "
+        "cases.\n"
+        "- Do NOT invent or include expected outputs; leave expectations "
+        "unknown unless they already appear in Known examples.\n"
     )
 
 
@@ -320,6 +329,109 @@ def _resolve_expectation(
     return "unknown", None, None
 
 
+def _is_numeric(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _constraint_violation_checker(
+    constraint: str, input_names: set[str]
+) -> Any | None:
+    """Return a predicate ``inputs -> bool`` if the constraint is interpretable.
+
+    Only exact, generic templates tied to declared input names are supported.
+    Unparseable constraints cannot be shown to be violated, so callers reject.
+    """
+    for name in input_names:
+        if constraint == f"{name} must not be zero":
+
+            def _violated_zero(
+                inputs: dict[str, Any], *, _name: str = name
+            ) -> bool:
+                value = inputs.get(_name)
+                return _is_numeric(value) and value == 0
+
+            return _violated_zero
+
+        if constraint in {
+            f"{name} must be positive",
+            f"{name} must be greater than zero",
+        }:
+
+            def _violated_positive(
+                inputs: dict[str, Any], *, _name: str = name
+            ) -> bool:
+                value = inputs.get(_name)
+                return _is_numeric(value) and value <= 0
+
+            return _violated_positive
+
+        if constraint in {
+            f"{name} must not be negative",
+            f"{name} must be non-negative",
+        }:
+
+            def _violated_non_negative(
+                inputs: dict[str, Any], *, _name: str = name
+            ) -> bool:
+                value = inputs.get(_name)
+                return _is_numeric(value) and value < 0
+
+            return _violated_non_negative
+
+    return None
+
+
+def _inputs_violate_constraint(
+    constraint: str, inputs: dict[str, Any], tool_spec: ToolSpec
+) -> bool:
+    """True only when inputs demonstrably violate the exact constraint text."""
+    checker = _constraint_violation_checker(
+        constraint, {spec.name for spec in tool_spec.inputs}
+    )
+    if checker is None:
+        raise ValueError(
+            f"constraint {constraint!r} cannot be checked deterministically; "
+            "constraint_invalid requires a demonstrable violation"
+        )
+    return bool(checker(inputs))
+
+
+def _boundary_values_from_tool_spec(
+    tool_spec: ToolSpec,
+) -> dict[str, set[float]]:
+    """Boundary values implied only by ToolSpec constraints — never invented."""
+    boundaries: dict[str, set[float]] = {}
+    input_names = {spec.name for spec in tool_spec.inputs}
+    for constraint in tool_spec.constraints:
+        for name in input_names:
+            if constraint == f"{name} must not be zero":
+                boundaries.setdefault(name, set()).add(0.0)
+            elif constraint in {
+                f"{name} must be positive",
+                f"{name} must be greater than zero",
+                f"{name} must not be negative",
+                f"{name} must be non-negative",
+            }:
+                boundaries.setdefault(name, set()).add(0.0)
+    return boundaries
+
+
+def _is_constraint_defined_boundary(
+    inputs: dict[str, Any], tool_spec: ToolSpec
+) -> bool:
+    """True when at least one input sits on a ToolSpec-defined boundary."""
+    boundaries = _boundary_values_from_tool_spec(tool_spec)
+    if not boundaries:
+        return False
+    for name, allowed in boundaries.items():
+        if name not in inputs:
+            continue
+        value = inputs[name]
+        if _is_numeric(value) and float(value) in allowed:
+            return True
+    return False
+
+
 def validate_and_build_tests(
     raw_candidates: list[dict[str, Any]], tool_spec: ToolSpec
 ) -> list[GeneratedTestCase]:
@@ -362,11 +474,31 @@ def validate_and_build_tests(
                     f"entry in ToolSpec.constraints; paraphrases and "
                     f"invented constraints are rejected"
                 )
+            if not _inputs_violate_constraint(
+                candidate.constraint, inputs, tool_spec
+            ):
+                raise ValueError(
+                    f"tests[{index}] is constraint_invalid for "
+                    f"{candidate.constraint!r} but inputs {inputs!r} "
+                    f"do not violate that constraint"
+                )
         elif candidate.constraint is not None:
             raise ValueError(
                 f"tests[{index}] may only set constraint for "
                 "constraint_invalid cases"
             )
+
+        if candidate.category == "boundary":
+            if not _boundary_values_from_tool_spec(tool_spec):
+                raise ValueError(
+                    f"tests[{index}] uses category 'boundary' but ToolSpec "
+                    "defines no constraint-derived boundaries"
+                )
+            if not _is_constraint_defined_boundary(inputs, tool_spec):
+                raise ValueError(
+                    f"tests[{index}] invents a boundary not defined by "
+                    f"ToolSpec constraints: inputs={inputs!r}"
+                )
 
         status, expected, test_case = _resolve_expectation(inputs, example_lookup)
         merged.append(

@@ -165,7 +165,8 @@ class TestGeneratorTests(unittest.TestCase):
     def test_boundary_and_valid_categories(self) -> None:
         raw = [
             {
-                "inputs": {"distance_km": 0.0, "time_hr": 1.0},
+                # Zero is a boundary implied by "time_hr must not be zero".
+                "inputs": {"distance_km": 10.0, "time_hr": 0.0},
                 "category": "boundary",
             },
             {
@@ -177,6 +178,63 @@ class TestGeneratorTests(unittest.TestCase):
         categories = {item.category for item in tests}
         self.assertIn("boundary", categories)
         self.assertIn("valid", categories)
+
+    def test_time_hr_zero_is_valid_constraint_violation(self) -> None:
+        raw = [
+            {
+                "inputs": {"distance_km": 10.0, "time_hr": 0.0},
+                "category": "constraint_invalid",
+                "constraint": "time_hr must not be zero",
+            }
+        ]
+        tests = validate_and_build_tests(raw, self._speed_spec())
+        invalid = [item for item in tests if item.category == "constraint_invalid"]
+        self.assertEqual(len(invalid), 1)
+        self.assertEqual(invalid[0].inputs["time_hr"], 0.0)
+        self.assertEqual(invalid[0].expectation_status, "unknown")
+        self.assertIsNone(invalid[0].expected)
+
+    def test_time_hr_one_must_not_be_constraint_invalid(self) -> None:
+        raw = [
+            {
+                "inputs": {"distance_km": 0.0, "time_hr": 1.0},
+                "category": "constraint_invalid",
+                "constraint": "time_hr must not be zero",
+            }
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            validate_and_build_tests(raw, self._speed_spec())
+        self.assertIn("do not violate", str(ctx.exception))
+
+    def test_unspecified_boundaries_must_not_be_invented(self) -> None:
+        # distance_km=0 is not implied by any ToolSpec constraint.
+        invented = [
+            {
+                "inputs": {"distance_km": 0.0, "time_hr": 1.0},
+                "category": "boundary",
+            }
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            validate_and_build_tests(invented, self._speed_spec())
+        self.assertIn("invents a boundary", str(ctx.exception))
+
+        # No constraints → no defined boundaries at all.
+        unconstrained = ToolSpec(
+            name="add",
+            purpose="add two numbers",
+            inputs=[
+                InputSpec(name="a", type="float"),
+                InputSpec(name="b", type="float"),
+            ],
+            output=OutputSpec(name="sum", type="number"),
+            constraints=[],
+        )
+        with self.assertRaises(ValueError) as ctx2:
+            validate_and_build_tests(
+                [{"inputs": {"a": 0.0, "b": 1.0}, "category": "boundary"}],
+                unconstrained,
+            )
+        self.assertIn("no constraint-derived boundaries", str(ctx2.exception))
 
     def test_generate_tests_success_with_mocked_model(self) -> None:
         payload = {
