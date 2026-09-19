@@ -492,8 +492,10 @@ def validate_and_build_tests(
 
         inputs = _validate_inputs_against_spec(candidate.inputs, tool_spec)
         fingerprint = _inputs_fingerprint(inputs)
+        # Skip duplicates of ToolSpec examples or earlier LLM candidates;
+        # do not fail the whole generation.
         if fingerprint in seen:
-            raise ValueError(f"tests[{index}] duplicates an existing test case")
+            continue
 
         if candidate.category == "constraint_invalid":
             if not tool_spec.constraints:

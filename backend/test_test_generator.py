@@ -73,16 +73,23 @@ class TestGeneratorTests(unittest.TestCase):
         self.assertEqual(added.expectation_status, "unknown")
         self.assertIsNone(added.expected)
 
-    def test_matching_example_inputs_keep_known_expected(self) -> None:
+    def test_llm_duplicate_of_toolspec_example_is_skipped(self) -> None:
+        """LLM re-emits a ToolSpec example → keep the seeded case once."""
         raw = [
             {
                 "inputs": {"distance_km": 120, "time_hr": 2},
                 "category": "valid",
             }
         ]
-        with self.assertRaises(ValueError):
-            # Exact duplicate of the seeded example must be rejected.
-            validate_and_build_tests(raw, self._speed_spec())
+        tests = validate_and_build_tests(raw, self._speed_spec())
+        matching = [
+            item
+            for item in tests
+            if item.inputs == {"distance_km": 120, "time_hr": 2}
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].expectation_status, "known")
+        self.assertEqual(matching[0].expected, 60)
 
     def test_reject_unknown_inputs(self) -> None:
         raw = [
@@ -104,7 +111,8 @@ class TestGeneratorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_and_build_tests(raw, self._speed_spec())
 
-    def test_reject_duplicate_candidates(self) -> None:
+    def test_llm_duplicate_generated_test_kept_once(self) -> None:
+        """Same generated inputs twice → only the first is kept."""
         raw = [
             {
                 "inputs": {"distance_km": 10.0, "time_hr": 1.0},
@@ -112,11 +120,56 @@ class TestGeneratorTests(unittest.TestCase):
             },
             {
                 "inputs": {"distance_km": 10.0, "time_hr": 1.0},
-                "category": "boundary",
+                "category": "valid",
             },
         ]
-        with self.assertRaises(ValueError):
-            validate_and_build_tests(raw, self._speed_spec())
+        tests = validate_and_build_tests(raw, self._speed_spec())
+        matching = [
+            item
+            for item in tests
+            if item.inputs == {"distance_km": 10.0, "time_hr": 1.0}
+        ]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(matching[0].category, "valid")
+        self.assertEqual(matching[0].expectation_status, "unknown")
+
+    def test_distinct_tests_are_preserved(self) -> None:
+        raw = [
+            {
+                "inputs": {"distance_km": 10.0, "time_hr": 1.0},
+                "category": "valid",
+            },
+            {
+                "inputs": {"distance_km": 50.0, "time_hr": 2.0},
+                "category": "valid",
+            },
+        ]
+        tests = validate_and_build_tests(raw, self._speed_spec())
+        # Seeded example + two distinct LLM cases.
+        self.assertEqual(len(tests), 3)
+        fingerprints = {
+            (item.inputs["distance_km"], item.inputs["time_hr"]) for item in tests
+        }
+        self.assertEqual(
+            fingerprints,
+            {(120, 2), (10.0, 1.0), (50.0, 2.0)},
+        )
+
+    def test_malformed_tests_still_fail_validation(self) -> None:
+        malformed_cases = [
+            {"inputs": {"distance_km": 10.0, "time_hr": 1.0, "extra": 1.0}, "category": "valid"},
+            {"inputs": {"distance_km": "far", "time_hr": 1.0}, "category": "valid"},
+            {
+                "inputs": {"distance_km": 10.0, "time_hr": 0.0},
+                "category": "constraint_invalid",
+                "constraint": "not a real constraint",
+            },
+            "not-an-object",
+        ]
+        for raw_item in malformed_cases:
+            with self.subTest(raw=raw_item):
+                with self.assertRaises(ValueError):
+                    validate_and_build_tests([raw_item], self._speed_spec())
 
     def test_constraint_invalid_requires_known_constraint(self) -> None:
         raw = [
