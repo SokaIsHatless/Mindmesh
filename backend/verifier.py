@@ -21,9 +21,14 @@ _BACKEND_DIR = str(Path(__file__).resolve().parent)
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
+# Flat models/Sandbox match how test_verifier constructs ToolSpec.
 from models import ToolSpec  # noqa: E402
 from Sandbox import run_tool, validate_imports  # noqa: E402
-from test_generator import GeneratedTestCase, TestGenerationResult  # noqa: E402
+
+try:  # Prefer package path so GeneratedTestCase identity matches test imports.
+    from .test_generator import GeneratedTestCase, TestGenerationResult
+except ImportError:
+    from test_generator import GeneratedTestCase, TestGenerationResult  # noqa: E402
 
 FLOAT_ABS_TOL = 1e-6
 FLOAT_REL_TOL = 1e-9
@@ -59,11 +64,37 @@ class VerificationResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _looks_like_generation_result(value: Any) -> bool:
+    """True for TestGenerationResult across package/flat dual imports."""
+    if isinstance(value, TestGenerationResult):
+        return True
+    # Duck-type when the same Pydantic model was loaded under two module paths.
+    return (
+        type(value).__name__ == "TestGenerationResult"
+        and hasattr(value, "success")
+        and hasattr(value, "tests")
+        and hasattr(value, "error")
+    )
+
+
+def _looks_like_generated_case(value: Any) -> bool:
+    """True for GeneratedTestCase across package/flat dual imports."""
+    if isinstance(value, GeneratedTestCase):
+        return True
+    return (
+        type(value).__name__ == "GeneratedTestCase"
+        and hasattr(value, "inputs")
+        and hasattr(value, "expectation_status")
+        and hasattr(value, "expected")
+        and hasattr(value, "category")
+    )
+
+
 def _normalize_tests(
     tests: TestGenerationResult | list[GeneratedTestCase],
-) -> tuple[list[GeneratedTestCase], str | None]:
+) -> tuple[list[Any], str | None]:
     """Accept TestGenerationResult or a bare list; surface generation errors."""
-    if isinstance(tests, TestGenerationResult):
+    if _looks_like_generation_result(tests):
         if not tests.success:
             return [], tests.error or "test generation was unsuccessful"
         return list(tests.tests), None
@@ -159,7 +190,7 @@ def values_match(expected: Any, actual_stdout: str) -> bool:
     return str(actual).strip() == str(expected).strip()
 
 
-def _is_verifiable(case: GeneratedTestCase) -> bool:
+def _is_verifiable(case: Any) -> bool:
     """Known expected values are required for pass/fail comparison."""
     return case.expectation_status == "known" and case.expected is not None
 
@@ -171,7 +202,7 @@ def _smoke_execute(code: str, tool_name: str) -> dict[str, Any]:
 
 
 def _run_one_test(
-    code: str, tool_spec: ToolSpec, case: GeneratedTestCase
+    code: str, tool_spec: ToolSpec, case: Any
 ) -> TestVerificationDetail:
     """Execute one verifiable case via the sandbox and compare outputs."""
     try:
@@ -327,7 +358,7 @@ def verify_tool(
 
     # --- (c)+(d) Run verifiable cases and compare -----------------------------
     for case in cases:
-        if not isinstance(case, GeneratedTestCase):
+        if not _looks_like_generated_case(case):
             failed.append(
                 TestVerificationDetail(
                     inputs={},
