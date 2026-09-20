@@ -9,6 +9,7 @@ Flow:
 from __future__ import annotations
 
 import ast
+import json
 import logging
 import operator
 import re
@@ -117,6 +118,17 @@ def set_ledger(ledger: Any | None) -> None:
 # ---------------------------------------------------------------------------
 # Execution ledger helpers (telemetry; never breaks the main request)
 # ---------------------------------------------------------------------------
+def _ledger_final_answer(answer: str) -> str:
+    """Prepare the API answer string for ExecutionLedger storage.
+
+    ``ExecutionLedger`` stores raw strings and ``json.loads`` them on read, so
+    a numeric API answer like ``\"7\"`` would come back as int ``7``. JSON-encode
+    string answers so retrieval matches the exact API string representation.
+    Non-numeric answers (e.g. ``\"60 km/h\"``) round-trip unchanged.
+    """
+    return json.dumps(answer)
+
+
 class _LedgerRun:
     """Per-request ledger session. All operations are best-effort."""
 
@@ -194,7 +206,7 @@ class _LedgerRun:
         try:
             self._ledger.complete_run(
                 self.execution_id,
-                final_answer=answer,
+                final_answer=_ledger_final_answer(answer),
                 tool_name=self.tool_name,
                 tool_version=self.tool_version,
             )
@@ -218,7 +230,11 @@ class _LedgerRun:
                 error,
                 tool_name=self.tool_name,
                 tool_version=self.tool_version,
-                final_answer=final_answer,
+                final_answer=(
+                    _ledger_final_answer(final_answer)
+                    if final_answer is not None
+                    else None
+                ),
             )
             self._finalized = True
         except Exception as exc:  # noqa: BLE001
