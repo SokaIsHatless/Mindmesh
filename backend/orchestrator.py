@@ -1,19 +1,62 @@
-"""Agent orchestrator — decision loop + toolbox + frontend trace."""
+"""Agent orchestrator — pipeline decision loop + frontend trace.
+
+Flow:
+  task → interpret → normalize → resolve capability
+       → reuse verified tool  OR  factory → tests → verify → register
+       → execute (Sandbox) → result validate → {answer, trace}
+"""
 
 from __future__ import annotations
 
 import ast
-import json
 import logging
 import operator
 import re
-from datetime import datetime, timezone
+import sys
 from pathlib import Path
 from typing import Any
 
-from .models import InputSpec, OutputSpec, TestCase, ToolSpec
-from .Sandbox import run_tool
-from .tool_factory import create_tool
+# Support ``backend.orchestrator`` and flat ``from orchestrator import …``.
+_BACKEND_DIR = str(Path(__file__).resolve().parent)
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
+try:
+    from .Sandbox import run_tool
+    from .capability_lifecycle import register_verified_capability
+    from .capability_resolver import resolve_capability
+    from .interpreter import interpret_task
+    from .models import (
+        CalculationRequest,
+        InputSpec,
+        OutputSpec,
+        TestCase,
+        ToolSpec,
+    )
+    from .normalizer import normalize_request
+    from .result_validator import validate_result
+    from .test_generator import generate_tests
+    from .tool_factory import create_tool
+    from .verifier import verify_tool
+    from .capabilities import CapabilityRegistry
+except ImportError:  # pragma: no cover - flat discovery / uvicorn from backend/
+    from Sandbox import run_tool
+    from capability_lifecycle import register_verified_capability
+    from capability_resolver import resolve_capability
+    from interpreter import interpret_task
+    from models import (
+        CalculationRequest,
+        InputSpec,
+        OutputSpec,
+        TestCase,
+        ToolSpec,
+    )
+    from normalizer import normalize_request
+    from result_validator import validate_result
+    from test_generator import generate_tests
+    from tool_factory import create_tool
+    from verifier import verify_tool
+    from capabilities import CapabilityRegistry
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -27,11 +70,30 @@ logger.setLevel(logging.INFO)
 logger.propagate = False
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths / registry
 # ---------------------------------------------------------------------------
 BACKEND_DIR = Path(__file__).resolve().parent
 TOOLBOX_DIR = BACKEND_DIR / "toolbox"
 MANIFEST_PATH = TOOLBOX_DIR / "manifest.json"
+REGISTRY_DB_PATH = BACKEND_DIR / "capabilities" / "capabilities.sqlite3"
+
+_registry: Any | None = None
+
+
+def get_registry() -> Any:
+    """Shared Capability Registry (lazy). Tests may replace via ``set_registry``."""
+    global _registry
+    if _registry is None:
+        REGISTRY_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _registry = CapabilityRegistry(REGISTRY_DB_PATH)
+    return _registry
+
+
+def set_registry(registry: Any | None) -> None:
+    """Replace or clear the process-wide registry (used by integration tests)."""
+    global _registry
+    _registry = registry
+
 
 # ---------------------------------------------------------------------------
 # Trace helpers (frontend contract)
@@ -43,22 +105,13 @@ def _step(step_type: str, label: str, detail: str | None = None) -> dict[str, st
     return item
 
 
-def _format_answer(tool_name: str, raw: str) -> str:
-    """Turn sandbox stdout into a display answer (e.g. speed -> '60 km/h')."""
-    text = (raw or "").strip()
-    if tool_name == "speed":
-        try:
-            value = float(text)
-            if value == int(value):
-                return f"{int(value)} km/h"
-            return f"{value} km/h"
-        except ValueError:
-            pass
-    return text
+def _finish(answer: str, trace: list[dict[str, str]]) -> dict[str, Any]:
+    trace.append(_step("answer", f"Answer: {answer}" if not answer.startswith("Answer:") else answer))
+    return {"answer": answer, "trace": trace}
 
 
 # ---------------------------------------------------------------------------
-# Toolbox helpers
+# Toolbox helpers (code on disk; registry holds verified metadata)
 # ---------------------------------------------------------------------------
 def _ensure_toolbox() -> None:
     TOOLBOX_DIR.mkdir(parents=True, exist_ok=True)
@@ -66,51 +119,28 @@ def _ensure_toolbox() -> None:
         MANIFEST_PATH.write_text("[]\n", encoding="utf-8")
 
 
-def _load_manifest() -> list[dict]:
+def _tool_code_path(name: str) -> Path:
+    return TOOLBOX_DIR / f"{name}.py"
+
+
+def _write_tool_file(name: str, code: str) -> str:
+    """Persist generated code under toolbox/; return absolute code_path."""
     _ensure_toolbox()
-    try:
-        data = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except (json.JSONDecodeError, OSError):
-        return []
+    path = _tool_code_path(name)
+    path.write_text(code.rstrip() + "\n", encoding="utf-8")
+    return str(path.resolve())
 
 
-def _save_manifest(entries: list[dict]) -> None:
-    _ensure_toolbox()
-    MANIFEST_PATH.write_text(
-        json.dumps(entries, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def _save_tool(name: str, code: str, description: str, inputs: list[str]) -> dict:
-    """Write <name>.py and upsert a manifest entry. Returns the entry."""
-    _ensure_toolbox()
-    (TOOLBOX_DIR / f"{name}.py").write_text(code.rstrip() + "\n", encoding="utf-8")
-
-    signature = f"{name}({', '.join(inputs)})"
-    entry = {
-        "name": name,
-        "signature": signature,
-        "description": description,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-    manifest = _load_manifest()
-    manifest = [e for e in manifest if e.get("name") != name]
-    manifest.append(entry)
-    _save_manifest(manifest)
-    return entry
-
-
-def _load_tool_code(name: str) -> str | None:
-    path = TOOLBOX_DIR / f"{name}.py"
-    if not path.exists():
+def _load_code(path: str) -> str | None:
+    file_path = Path(path)
+    if not file_path.is_file():
         return None
-    return path.read_text(encoding="utf-8")
+    return file_path.read_text(encoding="utf-8")
 
 
-# Canonical tool names for clear computational requests (not free-form NLP).
+# ---------------------------------------------------------------------------
+# Compatibility: known-quantity ToolSpec builders (existing demo contracts)
+# ---------------------------------------------------------------------------
 _KNOWN_QUANTITIES = {
     "speed": "speed",
     "velocity": "speed",
@@ -121,31 +151,15 @@ _KNOWN_QUANTITIES = {
     "prob": "probability",
 }
 
-_DEFAULT_ARGS = {
-    "speed": [120.0, 2.0],
-    "distance": [60.0, 2.0],
-    "time": [120.0, 60.0],
-    "probability": [13.0, 52.0],
-}
-
 
 def _intended_tool_name(task: str) -> str | None:
-    """
-    What tool purpose does this clear request ask for?
-    Prefer the quantity being computed, not every keyword in the sentence.
-    Returns None when there is no confident mapping → do not reuse.
-    """
     lower = task.lower().strip()
-
-    # "compute/calculate/find the <quantity>"
     m = re.search(
         r"\b(?:compute|calculate|find|determine|get)\s+(?:the\s+)?(\w+)",
         lower,
     )
     if m and m.group(1) in _KNOWN_QUANTITIES:
         return _KNOWN_QUANTITIES[m.group(1)]
-
-    # "<quantity> from ..." — left-hand quantity is what we build
     m = re.search(
         r"\b(speed|velocity|distance|time|average|probability)\b"
         r"(?:\s+\w+){0,3}\s+from\b",
@@ -153,46 +167,137 @@ def _intended_tool_name(task: str) -> str | None:
     )
     if m:
         return _KNOWN_QUANTITIES[m.group(1)]
-
-    # "train speed ...", or a leading known quantity as the subject
     m = re.search(
         r"\b(?:train\s+)?(speed|velocity|distance|time|average|probability)\b",
         lower,
     )
     if m:
         return _KNOWN_QUANTITIES[m.group(1)]
-
     if re.search(r"\bprobability\b", lower):
         return "probability"
-
     return None
 
 
-def _find_matching_tool(task: str, manifest: list[dict]) -> dict | None:
-    """
-    Reuse only on a confident purpose match (intended name == tool name).
-    Loose keyword overlap is NOT enough — e.g. a distance request must not
-    reuse a speed tool just because the word 'speed' appears in the text.
-    """
-    intended = _intended_tool_name(task)
-    if not intended:
-        return None
+def _slug_tool_name(task: str) -> str:
+    words = re.findall(r"[a-z0-9]+", task.lower())[:4]
+    return "_".join(words)[:32] or "custom_tool"
 
-    for entry in manifest:
-        name = (entry.get("name") or "").lower()
-        if name == intended:
-            return entry
-    return None
+
+def _build_tool_spec(task: str, operation: str | None = None) -> ToolSpec:
+    """Describe a clear computational request (legacy demo contracts preserved)."""
+    name: str | None = None
+    if operation:
+        op = operation.strip().lower()
+        if op in _KNOWN_QUANTITIES:
+            name = _KNOWN_QUANTITIES[op]
+        elif op in set(_KNOWN_QUANTITIES.values()):
+            name = op
+    if name is None:
+        name = _intended_tool_name(task) or _slug_tool_name(task)
+    if name in _KNOWN_QUANTITIES:
+        name = _KNOWN_QUANTITIES[name]
+    purpose = task.strip()
+
+    if name == "speed":
+        return ToolSpec(
+            name="speed",
+            purpose=purpose,
+            operation="speed",
+            inputs=[
+                InputSpec(name="distance_km", type="float", unit="km"),
+                InputSpec(name="time_hr", type="float", unit="hr"),
+            ],
+            outputs=[OutputSpec(name="speed_kmh", type="number", unit="km/h")],
+            constraints=["time_hr must not be zero"],
+            examples=[
+                TestCase(input={"distance_km": 120, "time_hr": 2}, expected=60)
+            ],
+        )
+    if name == "distance":
+        return ToolSpec(
+            name="distance",
+            purpose=purpose,
+            operation="distance",
+            inputs=[
+                InputSpec(name="speed_kmh", type="float", unit="km/h"),
+                InputSpec(name="time_hr", type="float", unit="hr"),
+            ],
+            outputs=[OutputSpec(name="distance_km", type="number", unit="km")],
+            examples=[TestCase(input={"speed_kmh": 60, "time_hr": 2}, expected=120)],
+        )
+    if name == "time":
+        return ToolSpec(
+            name="time",
+            purpose=purpose,
+            operation="time",
+            inputs=[
+                InputSpec(name="distance_km", type="float", unit="km"),
+                InputSpec(name="speed_kmh", type="float", unit="km/h"),
+            ],
+            outputs=[OutputSpec(name="time_hr", type="number", unit="hr")],
+            constraints=["speed_kmh must not be zero"],
+            examples=[
+                TestCase(input={"distance_km": 120, "speed_kmh": 60}, expected=2)
+            ],
+        )
+    if name == "probability":
+        return ToolSpec(
+            name="probability",
+            purpose=purpose,
+            operation="probability",
+            inputs=[
+                InputSpec(name="favorable", type="number"),
+                InputSpec(name="total", type="number"),
+            ],
+            outputs=[OutputSpec(name="probability", type="number")],
+            constraints=[
+                "total must not be zero",
+                "probability must be between 0 and 1",
+            ],
+            examples=[
+                TestCase(input={"favorable": 13, "total": 52}, expected=0.25)
+            ],
+        )
+
+    # Generic fallback from operation name only (no domain branches).
+    return ToolSpec(
+        name=name,
+        purpose=purpose,
+        operation=operation or name,
+        inputs=[InputSpec(name="x", type="number")],
+        outputs=[OutputSpec(name="result", type="number")],
+        examples=[TestCase(input={"x": 1}, expected=1)],
+    )
+
+
+def _tool_spec_from_capability(capability: Any) -> ToolSpec:
+    """Rebuild a ToolSpec from registry metadata for result validation."""
+    return ToolSpec(
+        name=capability.tool_id,
+        purpose=capability.description,
+        operation=capability.operation,
+        inputs=list(capability.input_schema),
+        output=capability.output_schema,
+    )
+
+
+def _aliases_for_tool_spec(tool_spec: ToolSpec) -> list[str]:
+    aliases: list[str] = []
+    op = (tool_spec.operation or "").strip().lower()
+    name = tool_spec.name.strip().lower()
+    if op and op != name:
+        aliases.append(op)
+    # Preserve legacy velocity → speed alias when registering speed.
+    if name == "speed" and "velocity" not in aliases:
+        aliases.append("velocity")
+    return aliases
 
 
 # ---------------------------------------------------------------------------
-# Trivial path — ONLY clean arithmetic (safe eval, no bare eval)
+# Trivial arithmetic (unchanged behavior)
 # ---------------------------------------------------------------------------
 _ARITH_CHARS_RE = re.compile(r"^[\d\.\+\-\*/\(\)\s]+$")
-
-# "3 x 4" / "3x4" / "(2) x 3" — x between numeric operands only, not in words.
 _X_AS_MUL_RE = re.compile(r"(?<=[\d\)])\s*[xX]\s*(?=[\d\(])")
-
 _BIN_OPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -212,55 +317,42 @@ DECLINE_MESSAGE = (
 
 
 def _normalize_multiply(expr: str) -> str:
-    """Turn × and operator-x into * before the restricted arithmetic check."""
     s = expr.replace("×", "*")
     s = _X_AS_MUL_RE.sub(" * ", s)
     return s
 
 
 def _eval_arith_node(node: ast.AST) -> float:
-    """Evaluate an AST that may contain only numbers and + - * / (unary ±)."""
     if isinstance(node, ast.Expression):
         return _eval_arith_node(node.body)
-
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return float(node.value)
-
     if isinstance(node, ast.BinOp) and type(node.op) in _BIN_OPS:
         left = _eval_arith_node(node.left)
         right = _eval_arith_node(node.right)
         if isinstance(node.op, ast.Div) and right == 0:
             raise ValueError("division by zero")
         return _BIN_OPS[type(node.op)](left, right)
-
     if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPS:
         return _UNARY_OPS[type(node.op)](_eval_arith_node(node.operand))
-
     raise ValueError("unsupported expression")
 
 
 def _try_eval_arithmetic(task: str) -> str | None:
-    """
-    If `task` is a clean arithmetic expression, return its result as a string.
-    Otherwise return None (not trivial — may decline or take tool path).
-    """
     expr = _normalize_multiply(task.strip())
     if not expr or not _ARITH_CHARS_RE.fullmatch(expr):
         return None
-
     try:
         tree = ast.parse(expr, mode="eval")
         value = _eval_arith_node(tree)
     except (SyntaxError, ValueError, TypeError, OverflowError):
         return None
-
     if value == int(value):
         return str(int(value))
     return str(value)
 
 
 def _is_trivial(task: str) -> bool:
-    """True only when the whole task is a safely evaluable arithmetic expression."""
     return _try_eval_arithmetic(task) is not None
 
 
@@ -271,344 +363,312 @@ def _answer_trivial(task: str) -> str:
     return result
 
 
-def _is_well_defined_request(task: str) -> bool:
-    """
-    True only for clear 'compute <quantity> from <inputs>' style requests.
-    Word problems and chat ("hi", "how far if speed is…") return False → decline.
-    """
-    lower = task.lower().strip()
+# ---------------------------------------------------------------------------
+# Sandbox execution + answer formatting
+# ---------------------------------------------------------------------------
+def _positional_args_from_inputs(
+    input_schema: list[Any], inputs: dict[str, float]
+) -> list[Any]:
+    args: list[Any] = []
+    for spec in input_schema:
+        if spec.name in inputs:
+            args.append(inputs[spec.name])
+        elif not getattr(spec, "required", True):
+            args.append(getattr(spec, "default", None))
+        else:
+            raise ValueError(f"missing required input '{spec.name}'")
+    return args
 
-    # "<quantity> from …" (e.g. train speed from distance and time)
-    if re.search(
-        r"\b(speed|velocity|distance|time|average|probability)\b"
-        r"(?:\s+\w+){0,3}\s+from\b",
-        lower,
-    ):
-        return True
 
-    # "compute/calculate the <quantity> from …"
-    if re.search(
-        r"\b(?:compute|calculate)\s+(?:the\s+)?"
-        r"(speed|velocity|distance|time|average|probability)\b"
-        r".*\bfrom\b",
-        lower,
-    ):
-        return True
+def _run_code(
+    code: str, function_name: str, args: list[Any]
+) -> tuple[str | None, dict[str, Any], str]:
+    entry_call = f"print({function_name}(*{args!r}))"
+    result = run_tool(code, entry_call)
+    if result.get("ok") and result.get("reason") == "ok":
+        return (result.get("stdout") or "").strip(), result, entry_call
+    return None, result, entry_call
 
-    return False
+
+def _format_answer(value: Any, unit: str | None) -> str:
+    if isinstance(value, float) and value == int(value):
+        text = str(int(value))
+    else:
+        text = str(value).strip()
+    if unit:
+        return f"{text} {unit}"
+    return text
+
+
+def _execute_and_validate(
+    *,
+    code: str,
+    function_name: str,
+    tool_spec: ToolSpec,
+    inputs: dict[str, float],
+    normalized_request: Any,
+) -> tuple[str | None, list[dict[str, str]]]:
+    """Run via Sandbox and validate. Returns (answer_or_None, extra_trace_steps)."""
+    steps: list[dict[str, str]] = []
+    try:
+        args = _positional_args_from_inputs(tool_spec.inputs, inputs)
+    except ValueError as exc:
+        steps.append(_step("fail", f"Execution failed: {exc}"))
+        return None, steps
+
+    raw, sandbox_result, call = _run_code(code, function_name, args)
+    if raw is None:
+        reason = sandbox_result.get("reason") or "execution failed"
+        steps.append(
+            _step(
+                "fail",
+                f"Execution failed: {reason}",
+                detail=(sandbox_result.get("stderr") or "")[:500] or None,
+            )
+        )
+        return None, steps
+
+    validation = validate_result(
+        tool_spec,
+        {"value": _parse_numeric_stdout(raw), "unit": tool_spec.output.unit},
+        unit=tool_spec.output.unit,
+        normalized_request=normalized_request,
+    )
+    if validation.status != "valid":
+        detail = "; ".join(validation.errors) or validation.details or "invalid"
+        steps.append(_step("fail", f"Result validation failed: {detail}"))
+        return None, steps
+
+    answer = _format_answer(
+        validation.normalized_value
+        if validation.normalized_value is not None
+        else validation.value,
+        validation.normalized_unit or tool_spec.output.unit,
+    )
+    steps.append(_step("pass", f"Result validated ({call})"))
+    return answer, steps
+
+
+def _parse_numeric_stdout(raw: str) -> Any:
+    text = (raw or "").strip()
+    try:
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        try:
+            return float(text)
+        except ValueError:
+            return text
 
 
 # ---------------------------------------------------------------------------
-# Task -> ToolSpec -> legacy factory spec / run args
+# Generation path: factory → tests → verify → register
 # ---------------------------------------------------------------------------
-def _slug_tool_name(task: str) -> str:
-    words = re.findall(r"[a-z0-9]+", task.lower())[:4]
-    return "_".join(words)[:32] or "custom_tool"
-
-
-def _build_tool_spec(task: str) -> ToolSpec:
-    """Describe a clear computational request without prescribing execution."""
-    name = _intended_tool_name(task) or _slug_tool_name(task)
-    purpose = task.strip()
-
-    if name == "speed":
-        return ToolSpec(
-            name="speed",
-            purpose=purpose,
-            inputs=[
-                InputSpec(name="distance_km", type="float", unit="km"),
-                InputSpec(name="time_hr", type="float", unit="hr"),
-            ],
-            outputs=[OutputSpec(name="speed_kmh", type="number", unit="km/h")],
-            constraints=["time_hr must not be zero"],
-            examples=[
-                TestCase(input={"distance_km": 120, "time_hr": 2}, expected=60)
-            ],
-        )
-    if name == "distance":
-        return ToolSpec(
-            name="distance",
-            purpose=purpose,
-            inputs=[
-                InputSpec(name="speed_kmh", type="float", unit="km/h"),
-                InputSpec(name="time_hr", type="float", unit="hr"),
-            ],
-            outputs=[OutputSpec(name="distance_km", type="number", unit="km")],
-            examples=[TestCase(input={"speed_kmh": 60, "time_hr": 2}, expected=120)],
-        )
-    if name == "time":
-        return ToolSpec(
-            name="time",
-            purpose=purpose,
-            inputs=[
-                InputSpec(name="distance_km", type="float", unit="km"),
-                InputSpec(name="speed_kmh", type="float", unit="km/h"),
-            ],
-            outputs=[OutputSpec(name="time_hr", type="number", unit="hr")],
-            constraints=["speed_kmh must not be zero"],
-            examples=[
-                TestCase(input={"distance_km": 120, "speed_kmh": 60}, expected=2)
-            ],
-        )
-    if name == "probability":
-        return ToolSpec(
-            name="probability",
-            purpose=purpose,
-            inputs=[
-                InputSpec(name="favorable", type="number"),
-                InputSpec(name="total", type="number"),
-            ],
-            outputs=[OutputSpec(name="probability", type="number")],
-            constraints=["total must not be zero", "probability must be between 0 and 1"],
-            examples=[TestCase(input={"favorable": 13, "total": 52}, expected=0.25)],
-        )
-
-    return ToolSpec(
-        name=name,
-        purpose=purpose,
-        inputs=[InputSpec(name="x", type="number")],
-        outputs=[OutputSpec(name="result", type="number")],
-        examples=[TestCase(input={"x": 1}, expected=1)],
-    )
-
-
-def _tool_spec_to_factory_task_spec(spec: ToolSpec) -> dict[str, Any]:
-    """Adapt the pure capability contract to the unchanged factory interface."""
-    input_names = [input_spec.name for input_spec in spec.inputs]
-    tests = [
-        {
-            "args": [
-                example.input.get(input_spec.name, input_spec.default)
-                for input_spec in spec.inputs
-            ],
-            "expected": example.expected,
-        }
-        for example in spec.examples
-    ]
-    return {
-        "name": spec.name,
-        "description": spec.purpose,
-        "inputs": input_names,
-        "tests": tests,
-    }
-
-
-def _param_count(signature: str) -> int:
-    match = re.search(r"\((.*)\)", signature or "")
-    if not match:
-        return 0
-    inner = match.group(1).strip()
-    if not inner:
-        return 0
-    return len([p for p in inner.split(",") if p.strip()])
-
-
-def _extract_numbers(task: str) -> list[float]:
-    return [float(n) for n in re.findall(r"\d+(?:\.\d+)?", task)]
-
-
-def _args_for_tool(
+def _generate_verify_register(
+    *,
     task: str,
-    signature: str,
-    tool_name: str = "",
-    fallback_args: list[float] | None = None,
-) -> list[float]:
+    tool_spec: ToolSpec,
+    registry: Any,
+    trace: list[dict[str, str]],
+) -> tuple[Any | None, str | None]:
     """
-    Use numbers from the task when present; otherwise tool-specific demo
-    defaults (or factory test args). Do not invent args from word problems.
+    Returns (capability_or_None, error_message_or_None).
+    Never registers unless verification status is verified.
     """
-    n = _param_count(signature)
-    nums = _extract_numbers(task)
-    if len(nums) >= n and n > 0:
-        return nums[:n]
+    trace.append(_step("no_tool", "No capability found — writing a new one"))
 
-    defaults = (
-        list(fallback_args)
-        if fallback_args is not None
-        else list(_DEFAULT_ARGS.get(tool_name, [120.0, 2.0, 1.0, 1.0]))
+    logger.info("Calling tool factory for %s", tool_spec.name)
+    factory_result = create_tool(tool_spec)
+    if not factory_result.get("success"):
+        err = factory_result.get("error") or "tool factory failed"
+        trace.append(_step("fail", f"Tool factory failed: {err}"))
+        return None, err
+
+    code = factory_result.get("code") or ""
+    name = factory_result.get("tool_name") or tool_spec.name
+    code_path = _write_tool_file(name, code)
+    trace.append(_step("writing", "Writing a Python tool", detail=code))
+
+    trace.append(_step("testing", "Generating independent verification tests"))
+    test_result = generate_tests(tool_spec)
+    if not getattr(test_result, "success", False):
+        err = getattr(test_result, "error", None) or "test generation failed"
+        trace.append(_step("fail", f"Test generation failed: {err}"))
+        return None, err
+
+    trace.append(_step("testing", "Verifying generated tool against tests"))
+    verification = verify_tool(tool_spec, code, test_result)
+    if getattr(verification, "status", None) != "verified":
+        err = (
+            getattr(verification, "details", None)
+            or "; ".join(getattr(verification, "errors", []) or [])
+            or f"verification status={getattr(verification, 'status', None)!r}"
+        )
+        trace.append(_step("fail", f"Verification failed: {err}"))
+        return None, err
+
+    trace.append(_step("pass", "Verification passed — registering capability"))
+    lifecycle = register_verified_capability(
+        tool_spec,
+        verification,
+        code_path,
+        registry=registry,
+        aliases=_aliases_for_tool_spec(tool_spec),
     )
-    while len(nums) < n:
-        nums.append(defaults[len(nums) % len(defaults)])
-    return nums[:n] if n else nums
+    if not getattr(lifecycle, "success", False):
+        err = getattr(lifecycle, "error", None) or "registration failed"
+        trace.append(_step("fail", f"Registration failed: {err}"))
+        return None, err
 
-
-def _format_arg(value: float) -> str:
-    return str(int(value)) if value == int(value) else str(value)
-
-
-def _run_existing_tool(
-    entry: dict,
-    task: str,
-    fallback_args: list[float] | None = None,
-) -> tuple[str | None, dict, str]:
-    """
-    Load toolbox/<name>.py and execute via Sandbox.run_tool.
-    Returns (stdout_or_None, sandbox_result, entry_call).
-    """
-    name = entry["name"]
-    code = _load_tool_code(name)
-    if code is None:
-        return None, {"ok": False, "reason": f"missing file {name}.py"}, ""
-
-    args = _args_for_tool(
-        task,
-        entry.get("signature", ""),
-        tool_name=name,
-        fallback_args=fallback_args,
-    )
-    call = f"print({name}({', '.join(_format_arg(a) for a in args)}))"
-    result = run_tool(code, call)
-    if result.get("ok"):
-        return (result.get("stdout") or "").strip(), result, call
-    return None, result, call
+    return lifecycle.capability, None
 
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-def handle_task(task: str) -> dict[str, Any]:
+def handle_task(task: str, *, registry: Any | None = None) -> dict[str, Any]:
     """
-    Decide:
-      1. trivial   -> evaluate clean arithmetic (incl. x / × as *)
-      2. reuse     -> well-defined request + existing toolbox tool
-      3. factory   -> well-defined request, no tool yet
-      4. decline   -> everything else (chat, word problems, ambiguous)
+    Orchestrate the full offline calculation pipeline.
 
-    Returns { "answer": str, "trace": [ {type, label, detail?} ] }
+    Returns ``{ "answer": str, "trace": [ {type, label, detail?} ] }`` for
+    ``POST /run`` (frontend-compatible).
     """
     trace: list[dict[str, str]] = []
     _ensure_toolbox()
+    active_registry = registry if registry is not None else get_registry()
 
     logger.info("=" * 60)
     logger.info("Incoming task: %r", task)
 
-    # --- Path 1: trivial arithmetic ---
+    # --- Direct arithmetic (preserve existing behavior) ---
     if _is_trivial(task):
         expr_result = _answer_trivial(task)
-        logger.info(
-            "Path chosen: TRIVIAL — task is a clean arithmetic expression"
-        )
-        logger.info("  expression=%r -> result=%r", task.strip(), expr_result)
+        logger.info("Path: TRIVIAL arithmetic → %r", expr_result)
+        trace.append(_step("plan", "This is trivial — I can answer directly"))
+        return _finish(expr_result, trace)
+
+    # --- Interpret ---
+    trace.append(_step("plan", "Interpreting the request"))
+    try:
+        interpreted = interpret_task(task)
+    except Exception as exc:  # noqa: BLE001 — surface cleanly to the client
+        logger.info("Interpretation raised: %s", exc)
+        trace.append(_step("fail", f"Interpretation failed: {exc}"))
+        return _finish(f"Could not interpret the request: {exc}", trace)
+
+    status = interpreted.get("status")
+    if status == "unsupported":
         trace.append(
-            _step("plan", "This is trivial — I can answer directly")
+            _step("plan", "This doesn't look like a well-defined calculation")
         )
-        answer = expr_result
-        trace.append(_step("answer", f"Answer: {answer}"))
-        return {"answer": answer, "trace": trace}
+        # Match prior decline UX (answer step without "Answer:" prefix historically)
+        trace.append(_step("answer", DECLINE_MESSAGE))
+        return {"answer": DECLINE_MESSAGE, "trace": trace}
 
-    # --- Path 4: decline non-computational / ambiguous / word problems ---
-    if not _is_well_defined_request(task):
-        logger.info(
-            "Path chosen: DECLINE — not clean arithmetic and not a "
-            "well-defined computational request"
+    if status == "needs_input":
+        missing = interpreted.get("missing_inputs") or []
+        missing_text = ", ".join(missing) if missing else "required inputs"
+        answer = f"I need more information: {missing_text}"
+        trace.append(_step("plan", f"Missing inputs: {missing_text}"))
+        return _finish(answer, trace)
+
+    if status == "error" or status != "ok":
+        err = interpreted.get("error") or "interpretation failed"
+        trace.append(_step("fail", f"Interpretation failed: {err}"))
+        return _finish(f"Could not interpret the request: {err}", trace)
+
+    operation = interpreted.get("operation")
+    trace[-1] = _step(
+        "plan",
+        f"Planning: this needs a {operation or 'custom'} calculation",
+    )
+
+    # --- Normalize ---
+    try:
+        calc = CalculationRequest(
+            status="ok",
+            operation=operation,
+            inputs={
+                str(key): float(value)
+                for key, value in (interpreted.get("inputs") or {}).items()
+            },
+            missing_inputs=[],
         )
-        answer = DECLINE_MESSAGE
+        normalized = normalize_request(calc)
+    except (TypeError, ValueError) as exc:
+        trace.append(_step("fail", f"Normalization failed: {exc}"))
+        return _finish(f"Could not normalize the request: {exc}", trace)
+
+    # --- Resolve ---
+    trace.append(_step("check", "Checking capability registry for a matching tool"))
+    try:
+        resolution = resolve_capability(normalized, active_registry)
+    except (TypeError, ValueError) as exc:
+        trace.append(_step("fail", f"Capability resolution failed: {exc}"))
+        return _finish(f"Could not resolve a capability: {exc}", trace)
+
+    capability = None
+    tool_spec: ToolSpec | None = None
+
+    if (
+        resolution.status == "found"
+        and resolution.capability is not None
+        and getattr(resolution.capability, "verification_status", None) == "verified"
+    ):
+        capability = resolution.capability
+        tool_spec = _tool_spec_from_capability(capability)
+        trace[-1] = _step(
+            "check",
+            f"Found verified capability '{capability.tool_id}' v{capability.version} — reusing it",
+            detail=f"{capability.operation} @ {capability.code_path}",
+        )
+    elif resolution.status == "ambiguous":
         trace.append(
-            _step(
-                "plan",
-                "This doesn't look like a well-defined calculation",
-            )
+            _step("fail", "Ambiguous capability match — cannot choose a tool")
         )
-        trace.append(_step("answer", answer))
-        return {"answer": answer, "trace": trace}
-
-    intended = _intended_tool_name(task) or "custom"
-    trace.append(
-        _step("plan", f"Planning: this needs a {intended} calculation")
-    )
-
-    # --- Path 2: reuse from toolbox (confident name match only) ---
-    trace.append(_step("check", "Checking toolbox for a matching tool"))
-    manifest = _load_manifest()
-    match = _find_matching_tool(task, manifest)
-    if match is not None:
-        raw, sandbox_result, call = _run_existing_tool(match, task)
-        if raw is not None:
-            answer = _format_answer(match["name"], raw)
-            logger.info(
-                "Path chosen: REUSE — matched existing tool '%s'",
-                match["name"],
-            )
-            logger.info("  signature=%s | call=%s", match.get("signature"), call)
-            trace[-1] = _step(
-                "check",
-                f"Found existing tool '{match['name']}' — reusing it",
-                detail=match.get("signature"),
-            )
-            trace.append(_step("answer", f"Answer: {answer}"))
-            return {"answer": answer, "trace": trace}
-
-        logger.info(
-            "Matched tool '%s' but sandbox run failed: reason=%s",
-            match["name"], sandbox_result.get("reason", "error"),
+        return _finish(
+            "Multiple capabilities match this request; please be more specific.",
+            trace,
         )
-        trace.append(
-            _step(
-                "fail",
-                f"Existing tool failed: {sandbox_result.get('reason', 'error')}",
-                detail=(sandbox_result.get("stderr") or "")[:500] or None,
-            )
-        )
-
-    # --- Path 3: create via factory ---
-    trace.append(_step("no_tool", "No tool found — writing a new one"))
-
-    tool_spec = _build_tool_spec(task)
-    task_spec = _tool_spec_to_factory_task_spec(tool_spec)
-    logger.info(
-        "Path chosen: FACTORY — no confident toolbox match, calling "
-        "create_tool() with task_spec: %s",
-        json.dumps(task_spec, indent=2),
-    )
-    result = create_tool(task_spec)
-
-    if not result.get("success"):
-        err = result.get("error") or "factory failed"
-        logger.info("Factory result: FAILURE — %s", err)
-        trace.append(_step("fail", f"Tool factory failed: {err}"))
-        answer = f"Could not build a tool: {err}"
-        trace.append(_step("answer", f"Answer: {answer}"))
-        return {"answer": answer, "trace": trace}
-
-    logger.info(
-        "Factory result: SUCCESS — tool=%s, attempts=%s",
-        result.get("tool_name"), result.get("attempts"),
-    )
-
-    name = result["tool_name"]
-    code = result["code"]
-    entry = _save_tool(
-        name,
-        code,
-        tool_spec.purpose,
-        [input_spec.name for input_spec in tool_spec.inputs],
-    )
-
-    trace.append(
-        _step("writing", "Writing a Python tool", detail=code)
-    )
-    trace.append(_step("testing", "Testing in sandbox against known values"))
-
-    test_args = None
-    if task_spec.get("tests"):
-        test_args = [float(a) for a in task_spec["tests"][0]["args"]]
-
-    raw, sandbox_result, call = _run_existing_tool(
-        entry, task, fallback_args=test_args
-    )
-    if raw is None:
-        reason = sandbox_result.get("reason", "nonzero exit")
-        trace.append(_step("fail", f"Test failed: {reason}"))
-        answer = f"Tool created but failed tests: {reason}"
-        trace.append(_step("answer", f"Answer: {answer}"))
-        return {"answer": answer, "trace": trace}
-
-    if name == "speed":
-        pass_label = "Test passed: speed(120, 2) == 60"
     else:
-        pass_label = f"Test passed: {call}"
-    trace.append(_step("pass", pass_label))
+        # Missing / unverified → generate
+        tool_spec = _build_tool_spec(task, operation=normalized.operation)
+        capability, gen_error = _generate_verify_register(
+            task=task,
+            tool_spec=tool_spec,
+            registry=active_registry,
+            trace=trace,
+        )
+        if capability is None:
+            return _finish(
+                f"Could not build a verified tool: {gen_error}",
+                trace,
+            )
+        # Prefer ToolSpec used for generation (has examples/constraints).
+        # Execution still uses registered code_path + tool_spec.name.
 
-    answer = _format_answer(name, raw)
-    trace.append(_step("answer", f"Answer: {answer}"))
-    return {"answer": answer, "trace": trace}
+    assert tool_spec is not None
+    assert capability is not None
+
+    code = _load_code(capability.code_path)
+    if code is None:
+        trace.append(
+            _step("fail", f"Missing tool file at {capability.code_path}")
+        )
+        return _finish(
+            f"Registered capability is missing its code file: {capability.code_path}",
+            trace,
+        )
+
+    function_name = tool_spec.name
+    answer, exec_steps = _execute_and_validate(
+        code=code,
+        function_name=function_name,
+        tool_spec=tool_spec,
+        inputs=dict(normalized.inputs),
+        normalized_request=normalized,
+    )
+    trace.extend(exec_steps)
+    if answer is None:
+        return _finish("Tool execution or result validation failed.", trace)
+
+    return _finish(answer, trace)
