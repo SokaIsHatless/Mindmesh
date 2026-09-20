@@ -43,6 +43,20 @@ class _ToolSpecModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    def __eq__(self, other: Any) -> bool:
+        """Value equality across flat ``models`` vs ``backend.models`` imports."""
+        if other is self:
+            return True
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        if type(other).__name__ != type(self).__name__:
+            return NotImplemented
+        return self.model_dump(mode="python") == other.model_dump(mode="python")
+
+    def __hash__(self) -> int:
+        # Keep models unhashable (default for mutable pydantic models).
+        return id(self)
+
 
 class InputSpec(_ToolSpecModel):
     """One named value accepted by a computational capability."""

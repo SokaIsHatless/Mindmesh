@@ -55,6 +55,28 @@ class Capability(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    def __eq__(self, other: Any) -> bool:
+        """Value equality when nested ToolSpec models come from dual imports.
+
+        Alias lists are compared as sets because the repository reads aliases
+        with ``ORDER BY alias`` while in-memory registration preserves
+        insertion order.
+        """
+        if other is self:
+            return True
+        if not isinstance(other, BaseModel):
+            return NotImplemented
+        if type(other).__name__ != "Capability":
+            return NotImplemented
+        left = self.model_dump(mode="python")
+        right = other.model_dump(mode="python")
+        left_aliases = left.pop("aliases", [])
+        right_aliases = right.pop("aliases", [])
+        return left == right and set(left_aliases) == set(right_aliases)
+
+    def __hash__(self) -> int:
+        return id(self)
+
     @field_validator("tool_id", "operation", mode="before")
     @classmethod
     def normalize_identifiers(cls, value: Any, info: Any) -> str:
@@ -103,7 +125,12 @@ class Capability(BaseModel):
     ) -> "Capability":
         """Build registry metadata from the existing declarative tool contract."""
         if not isinstance(tool_spec, ToolSpec):
-            raise TypeError("tool_spec must be a ToolSpec")
+            # Survive flat ``models`` vs ``backend.models`` dual imports.
+            if type(tool_spec).__name__ != "ToolSpec" or not hasattr(
+                tool_spec, "model_dump"
+            ):
+                raise TypeError("tool_spec must be a ToolSpec")
+            tool_spec = ToolSpec.model_validate(tool_spec.model_dump(mode="python"))
         return cls(
             tool_id=tool_id if tool_id is not None else tool_spec.name,
             operation=tool_spec.operation if tool_spec.operation is not None else tool_spec.name,
