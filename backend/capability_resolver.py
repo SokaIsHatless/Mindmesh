@@ -19,8 +19,12 @@ _BACKEND_DIR = str(Path(__file__).resolve().parent)
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-from capabilities import Capability, CapabilityRegistry  # noqa: E402
-from normalizer import NormalizedRequest  # noqa: E402
+try:  # Supports ``backend.capability_resolver`` and backend test discovery.
+    from .capabilities import Capability, CapabilityRegistry
+    from .normalizer import NormalizedRequest
+except ImportError:  # pragma: no cover - exercised by discovery import layout
+    from capabilities import Capability, CapabilityRegistry  # noqa: E402
+    from normalizer import NormalizedRequest  # noqa: E402
 
 
 ResolutionStatus = Literal["found", "missing", "ambiguous"]

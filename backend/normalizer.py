@@ -7,12 +7,21 @@ standardizes operations, input names, and units for later capability resolution.
 
 from __future__ import annotations
 
+import sys
 from math import isfinite
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from models import CalculationRequest
+_BACKEND_DIR = str(Path(__file__).resolve().parent)
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
+try:  # Prefer package path so CalculationRequest matches ``backend.orchestrator``.
+    from .models import CalculationRequest
+except ImportError:
+    from models import CalculationRequest
 
 # --- Operation aliases (source → canonical) ---
 OPERATION_ALIASES: dict[str, str] = {
@@ -285,12 +294,31 @@ def _normalize_missing_name(raw_name: str) -> str:
     return canonical
 
 
+def _looks_like_calculation_request(value: Any) -> bool:
+    """Accept CalculationRequest across flat ``models`` / ``backend.models``."""
+    if isinstance(value, CalculationRequest):
+        return True
+    return (
+        type(value).__name__ == "CalculationRequest"
+        and hasattr(value, "operation")
+        and hasattr(value, "inputs")
+        and hasattr(value, "missing_inputs")
+        and hasattr(value, "status")
+    )
+
+
 class RequestNormalizer:
     """Deterministic CalculationRequest → NormalizedRequest transformer."""
 
     def normalize(self, request: CalculationRequest) -> NormalizedRequest:
-        if not isinstance(request, CalculationRequest):
+        if not _looks_like_calculation_request(request):
             raise TypeError("request must be a CalculationRequest")
+
+        # Rebuild onto this module's CalculationRequest when dual-imported.
+        if not isinstance(request, CalculationRequest):
+            request = CalculationRequest.model_validate(
+                request.model_dump(mode="python")
+            )
 
         original_inputs = {
             str(name): _require_finite(str(name), value)
