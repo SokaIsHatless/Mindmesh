@@ -23,7 +23,6 @@ if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
 try:
-    from .Sandbox import run_tool
     from .capability_lifecycle import register_verified_capability
     from .capability_resolver import resolve_capability
     from .execution_ledger import ExecutionLedger
@@ -37,8 +36,10 @@ try:
     )
     from .normalizer import normalize_request
     from .result_validator import validate_result
+    from .Sandbox import run_tool
     from .test_generator import generate_tests
     from .tool_factory import create_tool
+    from .tool_spec_planner import plan_tool_spec
     from .verifier import verify_tool
     from .capabilities import CapabilityRegistry
 except ImportError:  # pragma: no cover - flat discovery / uvicorn from backend/
@@ -58,6 +59,7 @@ except ImportError:  # pragma: no cover - flat discovery / uvicorn from backend/
     from result_validator import validate_result
     from test_generator import generate_tests
     from tool_factory import create_tool
+    from tool_spec_planner import plan_tool_spec
     from verifier import verify_tool
     from capabilities import CapabilityRegistry
 
@@ -966,7 +968,16 @@ def handle_task(
     else:
         # Missing / unverified → generate
         session.stage("check", status="completed", detail={"match": "none"})
-        tool_spec = _build_tool_spec(task, operation=normalized.operation)
+        # Prefer relationship-aware ToolSpec planning (real vars + examples).
+        # Fall back to legacy builder only when the planner cannot handle it.
+        tool_spec = plan_tool_spec(
+            task=task,
+            operation=normalized.operation,
+            inputs=dict(normalized.inputs),
+            requested_output=interpreted.get("requested_output"),
+        )
+        if tool_spec is None:
+            tool_spec = _build_tool_spec(task, operation=normalized.operation)
         capability, gen_error = _generate_verify_register(
             task=task,
             tool_spec=tool_spec,

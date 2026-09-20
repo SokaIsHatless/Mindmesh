@@ -10,10 +10,12 @@ try:
     from . import interpreter
     from .interpreter import _validate_result, interpret_task
     from .models import CalculationRequest
+    from .tool_spec_planner import plan_tool_spec
 except ImportError:  # ``unittest discover -s backend``
     import interpreter
     from interpreter import _validate_result, interpret_task
     from models import CalculationRequest
+    from tool_spec_planner import plan_tool_spec
 
 
 class InterpreterRelationshipTests(unittest.TestCase):
@@ -171,6 +173,31 @@ class InterpreterRelationshipTests(unittest.TestCase):
                 missing_inputs=["height_cm", "weight_kg"],
                 requested_output="height_cm",
             )
+
+    def test_interpreted_height_from_bmi_plans_correct_toolspec(self) -> None:
+        """End-to-end planning: interpreter intent → ToolSpec for factory."""
+        interpreted = _validate_result(
+            {
+                "status": "needs_input",
+                "operation": "bmi",
+                "inputs": {"bmi": 20, "weight_kg": 80},
+                "missing_inputs": ["height_cm"],
+                "requested_output": "height_cm",
+            }
+        )
+        spec = plan_tool_spec(
+            task="If BMI is 20 and weight is 80 kg, what is the height?",
+            operation=interpreted["operation"],
+            inputs=interpreted["inputs"],
+            requested_output=interpreted["requested_output"],
+        )
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.name, "height_from_bmi")
+        self.assertEqual([i.name for i in spec.inputs], ["bmi", "weight_kg"])
+        self.assertEqual(spec.output.name, "height_cm")
+        self.assertEqual(spec.examples[0].expected, 200)
+        self.assertNotIn("if_bmi", spec.name)
 
 
 if __name__ == "__main__":
