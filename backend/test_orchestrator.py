@@ -5,21 +5,23 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 try:
     from . import orchestrator
     from .capabilities import Capability, CapabilityRegistry
+    from .execution_ledger import ExecutionLedger
     from .models import InputSpec, OutputSpec, TestCase, ToolSpec
-    from .orchestrator import handle_task, set_registry
+    from .orchestrator import handle_task, set_ledger, set_registry
     from .result_validator import ResultValidationResult
     from .test_generator import GeneratedTestCase, TestGenerationResult
     from .verifier import VerificationResult
 except ImportError:  # ``unittest discover -s backend``
     import orchestrator
     from capabilities import Capability, CapabilityRegistry
+    from execution_ledger import ExecutionLedger
     from models import InputSpec, OutputSpec, TestCase, ToolSpec
-    from orchestrator import handle_task, set_registry
+    from orchestrator import handle_task, set_ledger, set_registry
     from result_validator import ResultValidationResult
     from test_generator import GeneratedTestCase, TestGenerationResult
     from verifier import VerificationResult
@@ -30,10 +32,13 @@ class OrchestratorIntegrationTests(unittest.TestCase):
         self._temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self._temporary_directory.name)
         self.database_path = self.root / "capabilities.sqlite3"
+        self.ledger_path = self.root / "execution_ledger.sqlite3"
         self.toolbox_dir = self.root / "toolbox"
         self.toolbox_dir.mkdir(parents=True, exist_ok=True)
         self.registry = CapabilityRegistry(self.database_path)
+        self.ledger = ExecutionLedger(self.ledger_path)
         set_registry(self.registry)
+        set_ledger(self.ledger)
 
         self._toolbox_patch = patch.object(orchestrator, "TOOLBOX_DIR", self.toolbox_dir)
         self._manifest_patch = patch.object(
@@ -47,7 +52,9 @@ class OrchestratorIntegrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self._manifest_patch.stop()
         self._toolbox_patch.stop()
+        set_ledger(None)
         set_registry(None)
+        self.ledger.close()
         self.registry.close()
         self._temporary_directory.cleanup()
 
@@ -95,6 +102,14 @@ class OrchestratorIntegrationTests(unittest.TestCase):
     def _trace_types(self, result: dict) -> list[str]:
         return [step["type"] for step in result["trace"]]
 
+    def _latest_run(self) -> dict:
+        recent = self.ledger.list_recent_runs(limit=1)
+        self.assertEqual(len(recent), 1)
+        return recent[0]
+
+    def _stage_names(self, record: dict) -> list[str]:
+        return [stage["stage_name"] for stage in record["stages"]]
+
     def test_existing_capability_is_reused(self) -> None:
         self._register_speed_capability()
         with (
@@ -115,6 +130,12 @@ class OrchestratorIntegrationTests(unittest.TestCase):
         self.assertIn("check", self._trace_types(result))
         self.assertNotIn("no_tool", self._trace_types(result))
         self.assertNotIn("writing", self._trace_types(result))
+
+        record = self._latest_run()
+        self.assertEqual(record["final_status"], "completed")
+        self.assertIn("reuse", self._stage_names(record))
+        self.assertEqual(record["tool_name"], "speed")
+        self.assertEqual(record["tool_version"], "1")
 
     def test_missing_capability_generates_and_verifies(self) -> None:
         factory_payload = {
@@ -164,6 +185,25 @@ class OrchestratorIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(stored)
         self.assertEqual(stored.verification_status, "verified")
 
+        record = self._latest_run()
+        self.assertEqual(record["final_status"], "completed")
+        names = self._stage_names(record)
+        for required in (
+            "plan",
+            "check",
+            "no_tool",
+            "writing",
+            "testing",
+            "verification",
+            "registration",
+            "execution",
+            "validation",
+            "answer",
+        ):
+            self.assertIn(required, names)
+        self.assertEqual(record["tool_name"], "speed")
+        self.assertEqual(record["tool_version"], "1")
+
     def test_failed_verification_prevents_registration(self) -> None:
         factory_payload = {
             "success": True,
@@ -199,6 +239,12 @@ class OrchestratorIntegrationTests(unittest.TestCase):
         self.assertEqual(self.registry.list_capabilities(), [])
         self.assertIn("Verification failed", " ".join(s["label"] for s in result["trace"]))
         self.assertIn("fail", self._trace_types(result))
+
+        record = self._latest_run()
+        self.assertEqual(record["final_status"], "failed")
+        self.assertIn("failure", self._stage_names(record))
+        self.assertIn("verification", self._stage_names(record))
+        self.assertIn("sandbox mismatch", record["error"] or "")
 
     def test_successful_new_capability_is_registered_and_executed(self) -> None:
         factory_payload = {
@@ -240,6 +286,10 @@ class OrchestratorIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(self.registry.get_version("speed", "1"))
         self.assertTrue((self.toolbox_dir / "speed.py").is_file())
 
+        record = self._latest_run()
+        self.assertEqual(record["final_status"], "completed")
+        self.assertIn("30", str(record["final_answer"]))
+
     def test_result_validation_failure_is_handled(self) -> None:
         self._register_speed_capability()
         invalid = ResultValidationResult(
@@ -263,6 +313,11 @@ class OrchestratorIntegrationTests(unittest.TestCase):
             any("Result validation failed" in step["label"] for step in result["trace"])
         )
 
+        record = self._latest_run()
+        self.assertEqual(record["final_status"], "failed")
+        self.assertIn("validation", self._stage_names(record))
+        self.assertIn("failure", self._stage_names(record))
+
     def test_unsupported_request_is_handled(self) -> None:
         with patch.object(
             orchestrator,
@@ -279,6 +334,10 @@ class OrchestratorIntegrationTests(unittest.TestCase):
         self.assertEqual(result["answer"], orchestrator.DECLINE_MESSAGE)
         self.assertIn("plan", self._trace_types(result))
         self.assertIn("answer", self._trace_types(result))
+
+        record = self._latest_run()
+        self.assertEqual(record["final_status"], "completed")
+        self.assertEqual(record["final_answer"], orchestrator.DECLINE_MESSAGE)
 
     def test_missing_inputs_are_handled(self) -> None:
         with patch.object(
@@ -335,6 +394,9 @@ class OrchestratorIntegrationTests(unittest.TestCase):
         for required in ("plan", "check", "no_tool", "writing", "testing", "pass", "answer"):
             self.assertIn(required, types)
 
+        # Response contract unchanged: only answer + trace.
+        self.assertEqual(set(result.keys()), {"answer", "trace"})
+
     def test_direct_arithmetic_still_works(self) -> None:
         with patch.object(orchestrator, "interpret_task") as interpret_mock:
             result = handle_task("2+5")
@@ -344,6 +406,71 @@ class OrchestratorIntegrationTests(unittest.TestCase):
         self.assertEqual(result["trace"][0]["type"], "plan")
         self.assertIn("trivial", result["trace"][0]["label"].lower())
         self.assertEqual(result["trace"][-1]["type"], "answer")
+        self.assertEqual(set(result.keys()), {"answer", "trace"})
+
+        record = self._latest_run()
+        self.assertEqual(record["original_task"], "2+5")
+        self.assertEqual(record["final_status"], "completed")
+        self.assertEqual(record["final_answer"], "7")
+        self.assertIn("plan", self._stage_names(record))
+        self.assertIn("answer", self._stage_names(record))
+
+    def test_run_creates_ledger_entry(self) -> None:
+        with patch.object(orchestrator, "interpret_task") as interpret_mock:
+            handle_task("3*4")
+
+        interpret_mock.assert_not_called()
+        record = self._latest_run()
+        self.assertEqual(record["original_task"], "3*4")
+        self.assertTrue(record["execution_id"])
+        self.assertEqual(record["final_status"], "completed")
+
+    def test_ledger_records_tool_metadata_on_reuse(self) -> None:
+        self._register_speed_capability()
+        with patch.object(
+            orchestrator,
+            "interpret_task",
+            return_value=self._ok_interpretation(),
+        ):
+            handle_task("train speed 120 km in 2 hours")
+
+        record = self._latest_run()
+        self.assertEqual(record["tool_name"], "speed")
+        self.assertEqual(record["tool_version"], "1")
+        self.assertEqual(record["final_status"], "completed")
+
+    def test_ledger_failure_does_not_break_api_response(self) -> None:
+        broken = MagicMock()
+        broken.create_run.side_effect = RuntimeError("ledger unavailable")
+        set_ledger(broken)
+
+        with patch.object(orchestrator, "interpret_task") as interpret_mock:
+            result = handle_task("2+5")
+
+        interpret_mock.assert_not_called()
+        self.assertEqual(result["answer"], "7")
+        self.assertEqual(set(result.keys()), {"answer", "trace"})
+        self.assertEqual(result["trace"][-1]["type"], "answer")
+
+    def test_ledger_stage_append_failure_does_not_break_reuse(self) -> None:
+        self._register_speed_capability()
+        broken = MagicMock()
+        broken.create_run.return_value = "exec-1"
+        broken.append_stage.side_effect = RuntimeError("stage write failed")
+        broken.update_stage.side_effect = RuntimeError("stage update failed")
+        broken.complete_run.side_effect = RuntimeError("complete failed")
+        set_ledger(broken)
+
+        with patch.object(
+            orchestrator,
+            "interpret_task",
+            return_value=self._ok_interpretation(),
+        ):
+            result = handle_task("train speed 120 km in 2 hours")
+
+        self.assertIn("60", result["answer"])
+        self.assertEqual(set(result.keys()), {"answer", "trace"})
+        self.assertIn("reusing", " ".join(s["label"] for s in result["trace"]).lower())
 
 
 if __name__ == "__main__":
