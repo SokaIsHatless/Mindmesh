@@ -240,6 +240,8 @@ class CalculationRequest(BaseModel):
     operation: str | None = None
     inputs: dict[str, float] = Field(default_factory=dict)
     missing_inputs: list[str] = Field(default_factory=list)
+    # Quantity the user wants solved for (the unknown). Not a missing input.
+    requested_output: str | None = None
     error: str | None = None
 
     model_config = ConfigDict(extra="forbid")
@@ -255,6 +257,19 @@ class CalculationRequest(BaseModel):
         value = value.strip()
         if not value:
             raise ValueError("operation must not be blank")
+        return value
+
+    @field_validator("requested_output", mode="before")
+    @classmethod
+    def validate_requested_output(cls, value: Any) -> str | None:
+        """Optional unknown/output name; blank becomes None."""
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("requested_output must be a string or None")
+        value = value.strip()
+        if not value:
+            return None
         return value
 
     @field_validator("inputs", mode="before")
@@ -310,6 +325,21 @@ class CalculationRequest(BaseModel):
         if not isinstance(value, str):
             raise ValueError("error must be a string or None")
         return value
+
+    @model_validator(mode="after")
+    def validate_request_consistency(self) -> "CalculationRequest":
+        """Unknown output must not also appear as a provided or missing input."""
+        if self.requested_output is not None:
+            if self.requested_output in self.inputs:
+                raise ValueError(
+                    "requested_output cannot also appear in inputs"
+                )
+            if self.requested_output in self.missing_inputs:
+                raise ValueError(
+                    "requested_output is the unknown to solve for, not a "
+                    "missing input"
+                )
+        return self
 
 
 class TraceStep(BaseModel):
