@@ -463,86 +463,104 @@ def _is_constraint_defined_boundary(
 
 
 def validate_and_build_tests(
-    raw_candidates: list[dict[str, Any]], tool_spec: ToolSpec
+    raw_candidates: list[dict[str, Any]],
+    tool_spec: ToolSpec,
+    *,
+    strict: bool = True,
 ) -> list[GeneratedTestCase]:
-    """Deterministically validate model candidates and merge ToolSpec examples."""
+    """Deterministically validate model candidates and merge ToolSpec examples.
+
+    When ``strict=True`` (default), any malformed candidate raises ValueError.
+    When ``strict=False``, malformed candidates are skipped so sibling valid
+    candidates (and ToolSpec examples) can still be returned. Categories are
+    never rewritten — a boundary case with a non-null constraint is rejected,
+    not coerced into constraint_invalid.
+    """
     example_lookup = _example_expected_lookup(tool_spec)
     constraint_set = set(tool_spec.constraints)
     merged = _tests_from_examples(tool_spec)
     seen = {_inputs_fingerprint(item.inputs) for item in merged}
 
     for index, raw in enumerate(raw_candidates):
-        if not isinstance(raw, dict):
-            raise ValueError(f"tests[{index}] must be an object")
-
-        # Strip any invented expected fields from the model payload.
-        cleaned = {
-            key: value
-            for key, value in raw.items()
-            if key not in {"expected", "expectation_status", "test_case"}
-        }
         try:
-            candidate = _CandidateModel.model_validate(cleaned)
-        except Exception as exc:
-            raise ValueError(f"tests[{index}] malformed: {exc}") from exc
+            if not isinstance(raw, dict):
+                raise ValueError(f"tests[{index}] must be an object")
 
-        _assert_constraint_field_rules(
-            index, candidate.category, candidate.constraint
-        )
+            # Strip any invented expected fields from the model payload.
+            cleaned = {
+                key: value
+                for key, value in raw.items()
+                if key not in {"expected", "expectation_status", "test_case"}
+            }
+            try:
+                candidate = _CandidateModel.model_validate(cleaned)
+            except Exception as exc:
+                raise ValueError(f"tests[{index}] malformed: {exc}") from exc
 
-        inputs = _validate_inputs_against_spec(candidate.inputs, tool_spec)
-        fingerprint = _inputs_fingerprint(inputs)
-        # Skip duplicates of ToolSpec examples or earlier LLM candidates;
-        # do not fail the whole generation.
-        if fingerprint in seen:
-            continue
-
-        if candidate.category == "constraint_invalid":
-            if not tool_spec.constraints:
-                raise ValueError(
-                    f"tests[{index}] is constraint_invalid but ToolSpec "
-                    "declares no constraints"
-                )
-            if candidate.constraint not in constraint_set:
-                raise ValueError(
-                    f"tests[{index}] references constraint "
-                    f"{candidate.constraint!r} which is not an exact "
-                    f"entry in ToolSpec.constraints; paraphrases and "
-                    f"invented constraints are rejected"
-                )
-            if not _inputs_violate_constraint(
-                candidate.constraint, inputs, tool_spec
-            ):
-                raise ValueError(
-                    f"tests[{index}] is constraint_invalid for "
-                    f"{candidate.constraint!r} but inputs {inputs!r} "
-                    f"do not violate that constraint"
-                )
-
-        if candidate.category == "boundary":
-            if not _boundary_values_from_tool_spec(tool_spec):
-                raise ValueError(
-                    f"tests[{index}] uses category 'boundary' but ToolSpec "
-                    "defines no constraint-derived boundaries"
-                )
-            if not _is_constraint_defined_boundary(inputs, tool_spec):
-                raise ValueError(
-                    f"tests[{index}] invents a boundary not defined by "
-                    f"ToolSpec constraints: inputs={inputs!r}"
-                )
-
-        status, expected, test_case = _resolve_expectation(inputs, example_lookup)
-        merged.append(
-            GeneratedTestCase(
-                inputs=inputs,
-                category=candidate.category,
-                expectation_status=status,
-                expected=expected,
-                constraint=candidate.constraint,
-                test_case=test_case,
+            _assert_constraint_field_rules(
+                index, candidate.category, candidate.constraint
             )
-        )
-        seen.add(fingerprint)
+
+            inputs = _validate_inputs_against_spec(candidate.inputs, tool_spec)
+            fingerprint = _inputs_fingerprint(inputs)
+            # Skip duplicates of ToolSpec examples or earlier LLM candidates;
+            # do not fail the whole generation.
+            if fingerprint in seen:
+                continue
+
+            if candidate.category == "constraint_invalid":
+                if not tool_spec.constraints:
+                    raise ValueError(
+                        f"tests[{index}] is constraint_invalid but ToolSpec "
+                        "declares no constraints"
+                    )
+                if candidate.constraint not in constraint_set:
+                    raise ValueError(
+                        f"tests[{index}] references constraint "
+                        f"{candidate.constraint!r} which is not an exact "
+                        f"entry in ToolSpec.constraints; paraphrases and "
+                        f"invented constraints are rejected"
+                    )
+                if not _inputs_violate_constraint(
+                    candidate.constraint, inputs, tool_spec
+                ):
+                    raise ValueError(
+                        f"tests[{index}] is constraint_invalid for "
+                        f"{candidate.constraint!r} but inputs {inputs!r} "
+                        f"do not violate that constraint"
+                    )
+
+            if candidate.category == "boundary":
+                if not _boundary_values_from_tool_spec(tool_spec):
+                    raise ValueError(
+                        f"tests[{index}] uses category 'boundary' but ToolSpec "
+                        "defines no constraint-derived boundaries"
+                    )
+                if not _is_constraint_defined_boundary(inputs, tool_spec):
+                    raise ValueError(
+                        f"tests[{index}] invents a boundary not defined by "
+                        f"ToolSpec constraints: inputs={inputs!r}"
+                    )
+
+            status, expected, test_case = _resolve_expectation(
+                inputs, example_lookup
+            )
+            merged.append(
+                GeneratedTestCase(
+                    inputs=inputs,
+                    category=candidate.category,
+                    expectation_status=status,
+                    expected=expected,
+                    constraint=candidate.constraint,
+                    test_case=test_case,
+                )
+            )
+            seen.add(fingerprint)
+        except ValueError:
+            if strict:
+                raise
+            # Soft path (generate_tests): drop this candidate only.
+            continue
 
     return merged
 
@@ -561,12 +579,24 @@ def generate_tests(tool_spec: ToolSpec) -> TestGenerationResult:
         raw = call_model(prompt)
         payload = _extract_json_object(raw)
         candidates = _normalize_candidates(payload)
-        tests = validate_and_build_tests(candidates, tool_spec)
+        # Soft-filter: reject malformed LLM candidates without failing the
+        # whole generation. Strict validation rules are unchanged.
+        tests = validate_and_build_tests(candidates, tool_spec, strict=False)
     except (RuntimeError, ValueError, json.JSONDecodeError, TypeError) as exc:
         return TestGenerationResult(
             success=False,
             tool_name=tool_spec.name,
             error=str(exc),
+        )
+
+    if not tests:
+        return TestGenerationResult(
+            success=False,
+            tool_name=tool_spec.name,
+            error=(
+                "no usable test candidates remained after filtering "
+                "malformed model output"
+            ),
         )
 
     return TestGenerationResult(

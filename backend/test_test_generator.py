@@ -405,6 +405,80 @@ class TestGeneratorTests(unittest.TestCase):
             any(item.expectation_status == "unknown" for item in result.tests)
         )
 
+    def test_generate_tests_skips_boundary_with_non_null_constraint(self) -> None:
+        """Regression: inconsistent boundary+constraint is skipped, not fatal."""
+        payload = {
+            "tests": [
+                {
+                    "inputs": {"distance_km": 10.0, "time_hr": 0.0},
+                    "category": "boundary",
+                    # Invalid for boundary — must be rejected/skipped, never
+                    # rewritten into constraint_invalid.
+                    "constraint": "time_hr must not be zero",
+                },
+                {
+                    "inputs": {"distance_km": 50.0, "time_hr": 2.0},
+                    "category": "valid",
+                    "constraint": None,
+                },
+            ]
+        }
+        with patch.object(
+            test_generator, "call_model", return_value=json.dumps(payload)
+        ):
+            result = generate_tests(self._speed_spec())
+
+        self.assertTrue(result.success)
+        self.assertIsNone(result.error)
+
+        # Malformed boundary candidate must not appear (and must not be coerced).
+        self.assertFalse(
+            any(
+                item.category == "boundary" and item.constraint is not None
+                for item in result.tests
+            )
+        )
+        self.assertFalse(
+            any(
+                item.category == "boundary"
+                and item.inputs == {"distance_km": 10.0, "time_hr": 0.0}
+                for item in result.tests
+            )
+        )
+        self.assertFalse(
+            any(
+                item.category == "constraint_invalid"
+                and item.inputs == {"distance_km": 10.0, "time_hr": 0.0}
+                for item in result.tests
+            )
+        )
+
+        # Valid sibling candidate and ToolSpec example remain.
+        self.assertTrue(
+            any(
+                item.category == "valid"
+                and item.inputs == {"distance_km": 50.0, "time_hr": 2.0}
+                for item in result.tests
+            )
+        )
+        self.assertTrue(
+            any(item.expectation_status == "known" for item in result.tests)
+        )
+
+        # Direct strict validation still rejects the same malformed candidate.
+        with self.assertRaises(ValueError) as ctx:
+            validate_and_build_tests(
+                [
+                    {
+                        "inputs": {"distance_km": 10.0, "time_hr": 0.0},
+                        "category": "boundary",
+                        "constraint": "time_hr must not be zero",
+                    }
+                ],
+                self._speed_spec(),
+            )
+        self.assertIn("may only set constraint", str(ctx.exception))
+
     def test_generate_tests_handles_model_failure(self) -> None:
         with patch.object(
             test_generator,
